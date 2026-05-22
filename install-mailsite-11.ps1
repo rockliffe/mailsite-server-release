@@ -15,7 +15,6 @@ $Services = @(
     @{ Name = "SMTPDA"; File = "smtpda.exe" }
 )
 
-$MailSiteKey64 = "HKLM:\SOFTWARE\Rockliffe\MailSite"
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallerStateName = "MailSite11InstallerState"
 $InstallMarkerName = ".mailsite11-install.json"
@@ -47,25 +46,74 @@ function Get-RegistryString {
     return [string]$value
 }
 
+function Get-RegistryValue {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $null
+    }
+
+    return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+}
+
+function Assert-RegistryValuePresent {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    $value = Get-RegistryValue -Path $Path -Name $Name
+    if ($null -eq $value -or ([string]$value).Length -eq 0) {
+        throw "Required legacy MailSite registry value is missing: $Path\$Name."
+    }
+}
+
+function Export-MailSiteRegistryBackup {
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $backupPath = Join-Path ([IO.Path]::GetTempPath()) "MailSite-legacy-registry-$timestamp.reg"
+    $output = & reg.exe export "HKLM\Software\Rockliffe\MailSite" $backupPath /reg:32 /y 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to export legacy MailSite registry backup: $output"
+    }
+
+    return $backupPath
+}
+
+function Import-MailSiteRegistryBackup {
+    param([string]$BackupPath)
+
+    if ([string]::IsNullOrWhiteSpace($BackupPath) -or -not (Test-Path $BackupPath)) {
+        return
+    }
+
+    $output = & reg.exe import $BackupPath /reg:32 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to import MailSite registry backup from ${BackupPath}: $output"
+    }
+}
+
 function Set-MailSiteRegistryValue {
     param(
         [string]$Name,
         [string]$Value
     )
 
-    foreach ($path in @($MailSiteKey64, $MailSiteKey32)) {
-        New-Item -Path $path -Force | Out-Null
-        New-ItemProperty -Path $path -Name $Name -Value $Value -PropertyType String -Force | Out-Null
+    New-Item -Path $MailSiteKey32 -Force | Out-Null
+    if (Get-ItemProperty -Path $MailSiteKey32 -Name $Name -ErrorAction SilentlyContinue) {
+        Set-ItemProperty -Path $MailSiteKey32 -Name $Name -Value $Value
+    } else {
+        New-ItemProperty -Path $MailSiteKey32 -Name $Name -Value $Value -PropertyType String -Force | Out-Null
     }
 }
 
 function Remove-MailSiteRegistryValue {
     param([string]$Name)
 
-    foreach ($path in @($MailSiteKey64, $MailSiteKey32)) {
-        if (Test-Path $path) {
-            Remove-ItemProperty -Path $path -Name $Name -ErrorAction SilentlyContinue
-        }
+    if (Test-Path $MailSiteKey32) {
+        Remove-ItemProperty -Path $MailSiteKey32 -Name $Name -ErrorAction SilentlyContinue
     }
 }
 
@@ -111,6 +159,34 @@ function Start-MailSiteService {
     Start-Service -Name $ServiceName -ErrorAction Stop
 }
 
+function Copy-DirectoryAccessRules {
+    param(
+        [string]$SourceDirectory,
+        [string]$DestinationDirectory
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
+        throw "Cannot copy permissions because source directory does not exist: $SourceDirectory"
+    }
+    if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
+    }
+
+    $sourceAcl = Get-Acl -LiteralPath $SourceDirectory
+    $destinationAcl = Get-Acl -LiteralPath $DestinationDirectory
+
+    $destinationAcl.SetAccessRuleProtection($true, $false)
+
+    foreach ($rule in @($destinationAcl.Access)) {
+        [void]$destinationAcl.RemoveAccessRuleSpecific($rule)
+    }
+    foreach ($rule in $sourceAcl.Access) {
+        $destinationAcl.AddAccessRule($rule)
+    }
+
+    Set-Acl -LiteralPath $DestinationDirectory -AclObject $destinationAcl
+}
+
 function Get-ProductVersion {
     param([string]$Path)
 
@@ -126,14 +202,26 @@ function Get-ProductVersion {
 }
 
 function Assert-MailSite10 {
+    if (-not (Test-Path $MailSiteKey32)) {
+        throw "This installation of MailSite 11 requires an existing 32-bit MailSite $RequiredMajorVersion.x registry key at $MailSiteKey32."
+    }
+
+    foreach ($name in @("Version", "InstallDir", "ClusterVariant", "RegistryFormatVersion", "ServerMajorVersion", "License")) {
+        Assert-RegistryValuePresent -Path $MailSiteKey32 -Name $name
+    }
+
     $version = Get-RegistryString -Path $MailSiteKey32 -Name "Version"
     if ([string]::IsNullOrWhiteSpace($version) -or -not $version.StartsWith("$RequiredMajorVersion.")) {
         throw "This installation of MailSite 11 requires an existing MailSite $RequiredMajorVersion.x installation. Found registry version '$version'."
     }
 
     $legacyInstallDir = Get-RegistryString -Path $MailSiteKey32 -Name "InstallDir"
-    if ([string]::IsNullOrWhiteSpace($legacyInstallDir)) {
-        throw "Could not read legacy MailSite InstallDir from $MailSiteKey32."
+    $clusterVariant = Get-RegistryValue -Path $MailSiteKey32 -Name "ClusterVariant"
+    if ($clusterVariant -eq 4) {
+        $sqlConnectorKey = Join-Path $MailSiteKey32 "SqlConnector"
+        foreach ($name in @("DataSourceName", "DataSourceUser", "DataSourcePass", "ServerRole")) {
+            Assert-RegistryValuePresent -Path $sqlConnectorKey -Name $name
+        }
     }
 
     foreach ($service in $Services) {
@@ -199,9 +287,6 @@ function Save-InstallerState {
 function Load-InstallerState {
     $json = Get-RegistryString -Path $MailSiteKey32 -Name $InstallerStateName
     if ([string]::IsNullOrWhiteSpace($json)) {
-        $json = Get-RegistryString -Path $MailSiteKey64 -Name $InstallerStateName
-    }
-    if ([string]::IsNullOrWhiteSpace($json)) {
         throw "MailSite 11 installer state was not found. Cannot safely uninstall."
     }
 
@@ -209,7 +294,7 @@ function Load-InstallerState {
 }
 
 function Install-MailSite11 {
-    Assert-MailSite10 | Out-Null
+    $legacyInstallDir = Assert-MailSite10
 
     $package = Resolve-PackagePath
     $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
@@ -225,6 +310,7 @@ function Install-MailSite11 {
         $state = @{
             InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             InstallDir11 = $InstallDir11
+            RegistryBackupPath = Export-MailSiteRegistryBackup
             PreviousImagePath = @{}
             WasRunning = @{}
         }
@@ -237,6 +323,8 @@ function Install-MailSite11 {
 
         Write-Host "Installing MailSite 11 files to $InstallDir11..."
         New-Item -ItemType Directory -Path $InstallDir11 -Force | Out-Null
+        Write-Host "Copying directory permissions from $legacyInstallDir to $InstallDir11..."
+        Copy-DirectoryAccessRules -SourceDirectory $legacyInstallDir -DestinationDirectory $InstallDir11
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir11 -Recurse -Force
 
         Set-MailSiteRegistryValue -Name "InstallDir11" -Value $InstallDir11
@@ -250,16 +338,10 @@ function Install-MailSite11 {
             Set-ServiceImagePath -ServiceName $service.Name -ExecutablePath $newExe
         }
 
-        foreach ($service in $Services) {
-            if ($state.WasRunning[$service.Name]) {
-                Start-MailSiteService -ServiceName $service.Name
-            }
-        }
-
-        Write-Host "MailSite 11 installation completed successfully."
+        Write-Host "MailSite 11 installation completed successfully. Services were left stopped; start them manually after verification."
     } catch {
         if ($servicesStopped -and $null -ne $state) {
-            Write-Host "Install failed. Restoring previous service paths and startup state..."
+            Write-Host "Install failed. Restoring previous service paths and registry backup..."
             foreach ($service in $Services) {
                 $previous = $state.PreviousImagePath[$service.Name]
                 if (-not [string]::IsNullOrWhiteSpace($previous)) {
@@ -267,11 +349,7 @@ function Install-MailSite11 {
                     Set-ItemProperty -Path $path -Name ImagePath -Value $previous
                 }
             }
-            foreach ($service in $Services) {
-                if ($state.WasRunning[$service.Name]) {
-                    Start-MailSiteService -ServiceName $service.Name
-                }
-            }
+            Import-MailSiteRegistryBackup -BackupPath $state.RegistryBackupPath
         }
         Remove-MailSiteRegistryValue -Name "InstallDir11"
         Remove-MailSiteRegistryValue -Name $InstallerStateName
