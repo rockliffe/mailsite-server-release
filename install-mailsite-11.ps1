@@ -16,7 +16,6 @@ $Services = @(
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
-$InstallerStateName = "MailSite11InstallerState"
 $InstallMarkerName = ".mailsite11-install.json"
 $RequiredMajorVersion = "10"
 
@@ -71,52 +70,6 @@ function Assert-RegistryValuePresent {
     }
 }
 
-function Export-MailSiteRegistryBackup {
-    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupPath = Join-Path ([IO.Path]::GetTempPath()) "MailSite-legacy-registry-$timestamp.reg"
-    $output = & reg.exe export "HKLM\Software\Rockliffe\MailSite" $backupPath /reg:32 /y 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to export legacy MailSite registry backup: $output"
-    }
-
-    return $backupPath
-}
-
-function Import-MailSiteRegistryBackup {
-    param([string]$BackupPath)
-
-    if ([string]::IsNullOrWhiteSpace($BackupPath) -or -not (Test-Path $BackupPath)) {
-        return
-    }
-
-    $output = & reg.exe import $BackupPath /reg:32 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Failed to import MailSite registry backup from ${BackupPath}: $output"
-    }
-}
-
-function Set-MailSiteRegistryValue {
-    param(
-        [string]$Name,
-        [string]$Value
-    )
-
-    New-Item -Path $MailSiteKey32 -Force | Out-Null
-    if (Get-ItemProperty -Path $MailSiteKey32 -Name $Name -ErrorAction SilentlyContinue) {
-        Set-ItemProperty -Path $MailSiteKey32 -Name $Name -Value $Value
-    } else {
-        New-ItemProperty -Path $MailSiteKey32 -Name $Name -Value $Value -PropertyType String -Force | Out-Null
-    }
-}
-
-function Remove-MailSiteRegistryValue {
-    param([string]$Name)
-
-    if (Test-Path $MailSiteKey32) {
-        Remove-ItemProperty -Path $MailSiteKey32 -Name $Name -ErrorAction SilentlyContinue
-    }
-}
-
 function Get-ServiceImagePath {
     param([string]$ServiceName)
 
@@ -136,6 +89,51 @@ function Set-ServiceImagePath {
 
     $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
     Set-ItemProperty -Path $path -Name ImagePath -Value "`"$ExecutablePath`""
+}
+
+function Get-ImagePathExecutable {
+    param([string]$ImagePath)
+
+    if ([string]::IsNullOrWhiteSpace($ImagePath)) {
+        return $null
+    }
+
+    $trimmed = $ImagePath.Trim()
+    if ($trimmed.StartsWith('"')) {
+        $match = [regex]::Match($trimmed, '^"([^"]+)"')
+        if ($match.Success) {
+            return $match.Groups[1].Value
+        }
+    }
+
+    return ($trimmed -split '\s+', 2)[0]
+}
+
+function Resolve-UninstallServiceImagePath {
+    param(
+        [hashtable]$Service,
+        [string]$SavedImagePath
+    )
+
+    $savedExecutable = Get-ImagePathExecutable -ImagePath $SavedImagePath
+    if (-not [string]::IsNullOrWhiteSpace($savedExecutable) -and (Test-Path -LiteralPath $savedExecutable)) {
+        return $SavedImagePath
+    }
+
+    $legacyInstallDir = Get-RegistryString -Path $MailSiteKey32 -Name "InstallDir"
+    if (-not [string]::IsNullOrWhiteSpace($legacyInstallDir)) {
+        $legacyExecutable = Join-Path $legacyInstallDir $Service.File
+        if (Test-Path -LiteralPath $legacyExecutable) {
+            Write-Host "Saved service path for $($Service.Name) is unavailable; restoring to legacy install path $legacyExecutable."
+            return "`"$legacyExecutable`""
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SavedImagePath)) {
+        return $SavedImagePath
+    }
+
+    throw "Cannot determine restore path for service $($Service.Name)."
 }
 
 function Stop-MailSiteService {
@@ -174,15 +172,11 @@ function Copy-DirectoryAccessRules {
 
     $sourceAcl = Get-Acl -LiteralPath $SourceDirectory
     $destinationAcl = Get-Acl -LiteralPath $DestinationDirectory
+    $accessSections = [System.Security.AccessControl.AccessControlSections]::Access
 
-    $destinationAcl.SetAccessRuleProtection($true, $false)
-
-    foreach ($rule in @($destinationAcl.Access)) {
-        [void]$destinationAcl.RemoveAccessRuleSpecific($rule)
-    }
-    foreach ($rule in $sourceAcl.Access) {
-        $destinationAcl.AddAccessRule($rule)
-    }
+    # Copy the DACL as SDDL so unresolved legacy SIDs are preserved without name translation.
+    $sourceAccessSddl = $sourceAcl.GetSecurityDescriptorSddlForm($accessSections)
+    $destinationAcl.SetSecurityDescriptorSddlForm($sourceAccessSddl, $accessSections)
 
     Set-Acl -LiteralPath $DestinationDirectory -AclObject $destinationAcl
 }
@@ -279,17 +273,17 @@ function Save-InstallerState {
     param([hashtable]$State)
 
     $json = $State | ConvertTo-Json -Depth 5
-    Set-MailSiteRegistryValue -Name $InstallerStateName -Value $json
     $markerPath = Join-Path $InstallDir11 $InstallMarkerName
     Set-Content -Path $markerPath -Value $json -Encoding UTF8
 }
 
 function Load-InstallerState {
-    $json = Get-RegistryString -Path $MailSiteKey32 -Name $InstallerStateName
-    if ([string]::IsNullOrWhiteSpace($json)) {
-        throw "MailSite 11 installer state was not found. Cannot safely uninstall."
+    $markerPath = Join-Path $InstallDir11 $InstallMarkerName
+    if (-not (Test-Path -LiteralPath $markerPath)) {
+        throw "MailSite 11 installer state was not found at $markerPath. Cannot safely uninstall."
     }
 
+    $json = Get-Content -LiteralPath $markerPath -Raw
     return $json | ConvertFrom-Json
 }
 
@@ -310,7 +304,6 @@ function Install-MailSite11 {
         $state = @{
             InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             InstallDir11 = $InstallDir11
-            RegistryBackupPath = Export-MailSiteRegistryBackup
             PreviousImagePath = @{}
             WasRunning = @{}
         }
@@ -327,7 +320,6 @@ function Install-MailSite11 {
         Copy-DirectoryAccessRules -SourceDirectory $legacyInstallDir -DestinationDirectory $InstallDir11
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir11 -Recurse -Force
 
-        Set-MailSiteRegistryValue -Name "InstallDir11" -Value $InstallDir11
         Save-InstallerState -State $state
 
         foreach ($service in $Services) {
@@ -341,7 +333,7 @@ function Install-MailSite11 {
         Write-Host "MailSite 11 installation completed successfully. Services were left stopped; start them manually after verification."
     } catch {
         if ($servicesStopped -and $null -ne $state) {
-            Write-Host "Install failed. Restoring previous service paths and registry backup..."
+            Write-Host "Install failed. Restoring previous service paths..."
             foreach ($service in $Services) {
                 $previous = $state.PreviousImagePath[$service.Name]
                 if (-not [string]::IsNullOrWhiteSpace($previous)) {
@@ -349,10 +341,7 @@ function Install-MailSite11 {
                     Set-ItemProperty -Path $path -Name ImagePath -Value $previous
                 }
             }
-            Import-MailSiteRegistryBackup -BackupPath $state.RegistryBackupPath
         }
-        Remove-MailSiteRegistryValue -Name "InstallDir11"
-        Remove-MailSiteRegistryValue -Name $InstallerStateName
         throw
     } finally {
         Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -372,20 +361,10 @@ function Uninstall-MailSite11 {
 
     foreach ($service in $Services) {
         $previous = $state.PreviousImagePath.($service.Name)
-        if (-not [string]::IsNullOrWhiteSpace($previous)) {
-            $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
-            Set-ItemProperty -Path $path -Name ImagePath -Value $previous
-        }
+        $restorePath = Resolve-UninstallServiceImagePath -Service $service -SavedImagePath $previous
+        $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
+        Set-ItemProperty -Path $path -Name ImagePath -Value $restorePath
     }
-
-    foreach ($service in $Services) {
-        if ($state.WasRunning.($service.Name)) {
-            Start-MailSiteService -ServiceName $service.Name
-        }
-    }
-
-    Remove-MailSiteRegistryValue -Name "InstallDir11"
-    Remove-MailSiteRegistryValue -Name $InstallerStateName
 
     $markerPath = Join-Path $installedDir $InstallMarkerName
     if ((Test-Path $markerPath) -and (Test-Path $installedDir)) {
@@ -393,7 +372,7 @@ function Uninstall-MailSite11 {
         Remove-Item -Path $installedDir -Recurse -Force
     }
 
-    Write-Host "MailSite 11 uninstall completed successfully."
+    Write-Host "MailSite 11 uninstall completed successfully. Services were left stopped; start them manually after verification."
 }
 
 Assert-Administrator
