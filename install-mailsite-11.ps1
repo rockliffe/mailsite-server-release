@@ -287,6 +287,33 @@ function Load-InstallerState {
     return $json | ConvertFrom-Json
 }
 
+function Get-ExistingInstallerState {
+    $markerPath = Join-Path $InstallDir11 $InstallMarkerName
+    if (-not (Test-Path -LiteralPath $markerPath)) {
+        return $null
+    }
+
+    $json = Get-Content -LiteralPath $markerPath -Raw
+    return $json | ConvertFrom-Json
+}
+
+function Copy-StateMap {
+    param(
+        [object]$State,
+        [string]$PropertyName
+    )
+
+    $result = @{}
+    if ($null -eq $State -or $null -eq $State.$PropertyName) {
+        return $result
+    }
+
+    foreach ($property in $State.$PropertyName.PSObject.Properties) {
+        $result[$property.Name] = $property.Value
+    }
+    return $result
+}
+
 function Install-MailSite11 {
     $legacyInstallDir = Assert-MailSite10
 
@@ -294,22 +321,28 @@ function Install-MailSite11 {
     $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
     $state = $null
+    $rollbackImagePath = @{}
     $servicesStopped = $false
 
     try {
         Write-Host "Extracting $package..."
         Expand-Archive -Path $package -DestinationPath $extractRoot -Force
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
+        $existingState = Get-ExistingInstallerState
 
         $state = @{
             InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             InstallDir11 = $InstallDir11
-            PreviousImagePath = @{}
+            PreviousImagePath = Copy-StateMap -State $existingState -PropertyName "PreviousImagePath"
             WasRunning = @{}
         }
 
         foreach ($service in $Services) {
-            $state.PreviousImagePath[$service.Name] = Get-ServiceImagePath -ServiceName $service.Name
+            $currentImagePath = Get-ServiceImagePath -ServiceName $service.Name
+            $rollbackImagePath[$service.Name] = $currentImagePath
+            if (-not $state.PreviousImagePath.ContainsKey($service.Name)) {
+                $state.PreviousImagePath[$service.Name] = $currentImagePath
+            }
             $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
         }
         $servicesStopped = $true
@@ -335,7 +368,7 @@ function Install-MailSite11 {
         if ($servicesStopped -and $null -ne $state) {
             Write-Host "Install failed. Restoring previous service paths..."
             foreach ($service in $Services) {
-                $previous = $state.PreviousImagePath[$service.Name]
+                $previous = $rollbackImagePath[$service.Name]
                 if (-not [string]::IsNullOrWhiteSpace($previous)) {
                     $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
                     Set-ItemProperty -Path $path -Name ImagePath -Value $previous
