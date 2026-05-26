@@ -184,6 +184,25 @@ function Get-ProductVersion {
     return $versionInfo.ProductVersion.Trim()
 }
 
+function ConvertTo-MailSiteDisplayVersion {
+    param([string]$Version)
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        return $Version
+    }
+
+    try {
+        $parsed = [version]$Version.Trim()
+        if ($parsed.Build -ge 0) {
+            return "$($parsed.Major).$($parsed.Minor).$($parsed.Build)"
+        }
+    } catch {
+        return $Version.Trim()
+    }
+
+    return $Version.Trim()
+}
+
 function Get-ClusterVariantName {
     param([int]$ClusterVariant)
 
@@ -192,6 +211,36 @@ function Get-ClusterVariantName {
         4 { return "SQL Connector" }
         5 { return "LDAP Connector" }
         default { return "Unknown Connector" }
+    }
+}
+
+function Get-LatestRemotePackageVersion {
+    if ($PackageUrl -notmatch '^https://github\.com/([^/]+)/([^/]+)/raw/([^/]+)/MailSite\.zip$') {
+        return $null
+    }
+
+    $owner = $Matches[1]
+    $repo = $Matches[2]
+    $branch = $Matches[3]
+    $contentsUrl = "https://api.github.com/repos/$owner/$repo/contents?ref=$branch"
+
+    try {
+        $items = Invoke-RestMethod -Uri $contentsUrl -UseBasicParsing
+        $versions = @()
+        foreach ($item in $items) {
+            if ($item.name -match '^MailSite\.(11\.[0-9]+\.[0-9]+)\.zip$') {
+                $versions += [version]$Matches[1]
+            }
+        }
+
+        if ($versions.Count -eq 0) {
+            return $null
+        }
+
+        return (($versions | Sort-Object -Descending | Select-Object -First 1).ToString())
+    } catch {
+        Write-InstallerMessage "Could not determine latest MailSite package version from release repository before download: $($_.Exception.Message)" -Level "WARN"
+        return $null
     }
 }
 
@@ -280,6 +329,43 @@ function Resolve-PackagePath {
     }
 }
 
+function Get-PackageVersionFromZip {
+    param([string]$Path)
+
+    $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-version-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+    try {
+        Expand-Archive -Path $Path -DestinationPath $extractRoot -Force
+        $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
+        return Get-PackageVersion -PackageRoot $packageRoot
+    } finally {
+        Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Resolve-RequestedPackageVersion {
+    if (-not [string]::IsNullOrWhiteSpace($PackagePath)) {
+        if (-not (Test-Path -LiteralPath $PackagePath)) {
+            throw "PackagePath does not exist: $PackagePath"
+        }
+        return Get-PackageVersionFromZip -Path (Resolve-Path -LiteralPath $PackagePath).Path
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $sibling = Join-Path $PSScriptRoot "MailSite.zip"
+        if (Test-Path -LiteralPath $sibling) {
+            return Get-PackageVersionFromZip -Path (Resolve-Path -LiteralPath $sibling).Path
+        }
+    }
+
+    $remoteVersion = Get-LatestRemotePackageVersion
+    if (-not [string]::IsNullOrWhiteSpace($remoteVersion)) {
+        return $remoteVersion
+    }
+
+    return "11.N.NNN"
+}
+
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
@@ -307,10 +393,10 @@ function Get-PackageVersion {
         if ([string]::IsNullOrWhiteSpace($version) -or -not $version.StartsWith("$TargetMajorVersion.")) {
             throw "Package executable $exe has unexpected version '$version'."
         }
-        $versions += $version
+        $versions += ConvertTo-MailSiteDisplayVersion -Version $version
     }
 
-    $uniqueVersions = $versions | Sort-Object -Unique
+    $uniqueVersions = @($versions | Sort-Object -Unique)
     if ($uniqueVersions.Count -ne 1) {
         throw "Package contains mixed executable versions: $($uniqueVersions -join ', ')."
     }
@@ -335,10 +421,10 @@ function Get-InstalledMailSite11Version {
         if ([string]::IsNullOrWhiteSpace($version) -or -not $version.StartsWith("$TargetMajorVersion.")) {
             return $null
         }
-        $versions += $version
+        $versions += ConvertTo-MailSiteDisplayVersion -Version $version
     }
 
-    $uniqueVersions = $versions | Sort-Object -Unique
+    $uniqueVersions = @($versions | Sort-Object -Unique)
     if ($uniqueVersions.Count -eq 1) {
         return $uniqueVersions[0]
     }
@@ -394,6 +480,12 @@ function Confirm-MailSiteInstall {
     }
 }
 
+function Test-ExactMailSiteVersion {
+    param([string]$Version)
+
+    return $Version -match '^11\.[0-9]+\.[0-9]+$'
+}
+
 function Set-MailSiteFirewallRules {
     param(
         [hashtable]$Service,
@@ -404,7 +496,19 @@ function Set-MailSiteFirewallRules {
         throw "Windows firewall cmdlets are not available on this system."
     }
 
-    foreach ($direction in @("Inbound", "Outbound")) {
+    $directions = @("Inbound")
+    if ($Service.Name -eq "SMTPDA") {
+        $directions += "Outbound"
+    } else {
+        $obsoleteDisplayName = "MailSite 11 $($Service.Name) Outbound"
+        $obsoleteRules = Get-NetFirewallRule -DisplayName $obsoleteDisplayName -ErrorAction SilentlyContinue
+        if ($obsoleteRules) {
+            $obsoleteRules | Remove-NetFirewallRule | Out-Null
+            Write-InstallerMessage "Removed obsolete firewall rule '$obsoleteDisplayName'."
+        }
+    }
+
+    foreach ($direction in $directions) {
         $displayName = "MailSite 11 $($Service.Name) $direction"
         $existingRules = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
         if ($existingRules) {
@@ -435,8 +539,17 @@ function Install-MailSite {
     $legacy = Assert-MailSite10
     Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
 
-    Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."
-    Copy-DirectoryAccessRules -SourceDirectory $legacy.LegacyInstallDir -DestinationDirectory $InstallDir
+    $requestedVersion = Resolve-RequestedPackageVersion
+    $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
+    if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and $installedVersion -eq $requestedVersion) {
+        Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
+        return
+    }
+
+    if (-not (Confirm-MailSiteInstall -Version $requestedVersion)) {
+        Write-InstallerMessage "Installation cancelled by user."
+        return
+    }
 
     $package = Resolve-PackagePath -DestinationDirectory $InstallDir
     $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
@@ -445,27 +558,18 @@ function Install-MailSite {
     $state = $null
     $rollbackImagePath = @{}
     $servicesStopped = $false
-    $installConfirmed = $false
 
     try {
         Write-InstallerMessage "Extracting $package..."
         Expand-Archive -Path $package -DestinationPath $extractRoot -Force
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
-        $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
 
         if ($installedVersion -eq $targetVersion) {
             Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
             Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
             return
         }
-
-        if (-not (Confirm-MailSiteInstall -Version $targetVersion)) {
-            Write-InstallerMessage "Installation cancelled by user."
-            Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
-            return
-        }
-        $installConfirmed = $true
 
         if ([string]::IsNullOrWhiteSpace($installedVersion)) {
             Write-InstallerMessage "Installing MailSite $targetVersion to $InstallDir..."
@@ -492,6 +596,9 @@ function Install-MailSite {
         }
         $servicesStopped = $true
 
+        Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."
+        Copy-DirectoryAccessRules -SourceDirectory $legacy.LegacyInstallDir -DestinationDirectory $InstallDir
+
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
 
         Save-InstallerState -State $state
@@ -517,8 +624,6 @@ function Install-MailSite {
                     Set-ItemProperty -Path $path -Name ImagePath -Value $previous
                 }
             }
-        } elseif (-not $installConfirmed -and -not [string]::IsNullOrWhiteSpace($package)) {
-            Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
         }
         throw
     } finally {

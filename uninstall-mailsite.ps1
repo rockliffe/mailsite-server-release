@@ -141,6 +141,24 @@ function Stop-MailSiteService {
     return $true
 }
 
+function Remove-MailSiteFirewallRules {
+    if (-not (Get-Command -Name Remove-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        Write-UninstallerMessage "Windows firewall cmdlets are not available; skipping MailSite 11 firewall rule cleanup." -Level "WARN"
+        return
+    }
+
+    foreach ($service in $Services) {
+        foreach ($direction in @("Inbound", "Outbound")) {
+            $displayName = "MailSite 11 $($service.Name) $direction"
+            $rules = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
+            if ($rules) {
+                $rules | Remove-NetFirewallRule | Out-Null
+                Write-UninstallerMessage "Removed firewall rule '$displayName'."
+            }
+        }
+    }
+}
+
 function Load-InstallerState {
     $markerPath = Join-Path $InstallDir $InstallMarkerName
     if (-not (Test-Path -LiteralPath $markerPath)) {
@@ -172,6 +190,8 @@ function Uninstall-MailSite {
         Set-ItemProperty -Path $path -Name ImagePath -Value $restorePath
         Write-UninstallerMessage "Restored $($service.Name) service path to $restorePath."
     }
+
+    Remove-MailSiteFirewallRules
 
     $markerPath = Join-Path $installedDir $InstallMarkerName
     if ((Test-Path -LiteralPath $markerPath) -and (Test-Path -LiteralPath $installedDir)) {
