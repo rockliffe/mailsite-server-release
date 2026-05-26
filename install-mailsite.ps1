@@ -314,8 +314,16 @@ function Resolve-PackagePath {
         return $destinationPackage
     }
 
-    $sibling = Join-Path $PSScriptRoot "MailSite.zip"
-    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot) -and (Test-Path -LiteralPath $sibling)) {
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $sibling = Join-Path $PSScriptRoot "MailSite.zip"
+        if (-not (Test-Path -LiteralPath $sibling)) {
+            $sibling = $null
+        }
+    } else {
+        $sibling = $null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($sibling)) {
         if ((Resolve-Path -LiteralPath $sibling).Path -ne $destinationPackage) {
             Write-InstallerMessage "Copying MailSite package to $destinationPackage..."
             Copy-Item -LiteralPath $sibling -Destination $destinationPackage -Force
