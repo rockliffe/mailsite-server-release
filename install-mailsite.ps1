@@ -249,7 +249,7 @@ function Assert-MailSite10 {
         throw "This installation of MailSite 11 requires an existing 32-bit MailSite $RequiredLegacyMajorVersion.x registry key at $MailSiteKey32."
     }
 
-    foreach ($name in @("Version", "InstallDir", "ClusterVariant", "RegistryFormatVersion", "ServerMajorVersion", "License")) {
+    foreach ($name in @("Version", "InstallDir", "RegistryFormatVersion", "ServerMajorVersion", "License")) {
         Assert-RegistryValuePresent -Path $MailSiteKey32 -Name $name
     }
 
@@ -264,7 +264,10 @@ function Assert-MailSite10 {
     }
 
     $clusterVariantRaw = Get-RegistryValue -Path $MailSiteKey32 -Name "ClusterVariant"
-    $clusterVariant = [int]$clusterVariantRaw
+    $clusterVariant = 0
+    if ($null -ne $clusterVariantRaw -and ([string]$clusterVariantRaw).Length -gt 0) {
+        $clusterVariant = [int]$clusterVariantRaw
+    }
     $connectorName = Get-ClusterVariantName -ClusterVariant $clusterVariant
 
     if ($clusterVariant -eq 4) {
