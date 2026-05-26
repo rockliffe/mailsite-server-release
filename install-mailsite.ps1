@@ -497,6 +497,15 @@ function Test-ExactMailSiteVersion {
     return $Version -match '^11\.[0-9]+\.[0-9]+$'
 }
 
+function Compare-MailSiteVersions {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    return ([version]$Left).CompareTo([version]$Right)
+}
+
 function Set-MailSiteFirewallRules {
     param(
         [hashtable]$Service,
@@ -552,9 +561,20 @@ function Install-MailSite {
 
     $requestedVersion = Resolve-RequestedPackageVersion
     $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
-    if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and $installedVersion -eq $requestedVersion) {
-        Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
-        return
+    if (-not [string]::IsNullOrWhiteSpace($installedVersion)) {
+        Write-InstallerMessage "Detected existing MailSite $installedVersion in $InstallDir."
+    }
+
+    if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and (Test-ExactMailSiteVersion -Version $installedVersion)) {
+        $requestedComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
+        if ($requestedComparison -eq 0) {
+            Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
+            return
+        }
+        if ($requestedComparison -lt 0) {
+            Write-InstallerMessage "MailSite $installedVersion is already installed, which is newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
+            return
+        }
     }
 
     if (-not (Confirm-MailSiteInstall -Version $requestedVersion)) {
@@ -576,10 +596,16 @@ function Install-MailSite {
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
 
-        if ($installedVersion -eq $targetVersion) {
-            Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
-            Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
-            return
+        if (Test-ExactMailSiteVersion -Version $installedVersion) {
+            $targetComparison = Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion
+            if ($targetComparison -eq 0) {
+                Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
+                Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
+                return
+            }
+            if ($targetComparison -lt 0) {
+                throw "Cannot install MailSite $targetVersion because MailSite $installedVersion is already installed. Download a newer MailSite package and retry."
+            }
         }
 
         if ([string]::IsNullOrWhiteSpace($installedVersion)) {
