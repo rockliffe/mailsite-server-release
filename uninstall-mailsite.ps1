@@ -141,6 +141,26 @@ function Stop-MailSiteService {
     return $true
 }
 
+function Restore-ServiceDescription {
+    param(
+        [string]$ServiceName,
+        [object]$State
+    )
+
+    if ($null -eq $State.PreviousDescription) {
+        return
+    }
+
+    $property = $State.PreviousDescription.PSObject.Properties[$ServiceName]
+    if ($null -eq $property) {
+        return
+    }
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    Set-ItemProperty -Path $path -Name Description -Value ([string]$property.Value)
+    Write-UninstallerMessage "Restored $ServiceName service description."
+}
+
 function Remove-MailSiteFirewallRules {
     if (-not (Get-Command -Name Remove-NetFirewallRule -ErrorAction SilentlyContinue)) {
         Write-UninstallerMessage "Windows firewall cmdlets are not available; skipping MailSite 11 firewall rule cleanup." -Level "WARN"
@@ -189,6 +209,7 @@ function Uninstall-MailSite {
         $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
         Set-ItemProperty -Path $path -Name ImagePath -Value $restorePath
         Write-UninstallerMessage "Restored $($service.Name) service path to $restorePath."
+        Restore-ServiceDescription -ServiceName $service.Name -State $state
     }
 
     Remove-MailSiteFirewallRules

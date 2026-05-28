@@ -8,10 +8,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Services = @(
-    @{ Name = "HTTPMA"; File = "httpma.exe" },
-    @{ Name = "IMAP4A"; File = "imap4a.exe" },
-    @{ Name = "SMTPRA"; File = "smtpra.exe" },
-    @{ Name = "SMTPDA"; File = "smtpda.exe" }
+    @{ Name = "HTTPMA"; File = "httpma.exe"; Description = "MailSite HTTP Management Agent" },
+    @{ Name = "IMAP4A"; File = "imap4a.exe"; Description = "MailSite IMAP4 Server" },
+    @{ Name = "SMTPRA"; File = "smtpra.exe"; Description = "MailSite SMTP Receiving Agent" },
+    @{ Name = "SMTPDA"; File = "smtpda.exe"; Description = "MailSite SMTP Delivery Agent" }
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
@@ -131,6 +131,32 @@ function Set-ServiceImagePath {
     Set-ItemProperty -Path $path -Name ImagePath -Value "`"$ExecutablePath`""
 }
 
+function Get-ServiceDescription {
+    param([string]$ServiceName)
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path $path)) {
+        throw "Windows service '$ServiceName' is not installed."
+    }
+
+    $description = (Get-ItemProperty -Path $path -Name Description -ErrorAction SilentlyContinue).Description
+    if ($null -eq $description) {
+        return ""
+    }
+
+    return [string]$description
+}
+
+function Set-ServiceDescription {
+    param(
+        [string]$ServiceName,
+        [string]$Description
+    )
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    Set-ItemProperty -Path $path -Name Description -Value $Description
+}
+
 function Stop-MailSiteService {
     param([string]$ServiceName)
 
@@ -144,6 +170,26 @@ function Stop-MailSiteService {
     Stop-Service -Name $ServiceName -Force -ErrorAction Stop
     $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(60))
     return $true
+}
+
+function Start-MailSiteService {
+    param([string]$ServiceName)
+
+    try {
+        $service = Get-Service -Name $ServiceName -ErrorAction Stop
+        if ($service.Status -eq "Running") {
+            Write-InstallerMessage "$ServiceName is already running."
+            return $true
+        }
+
+        Write-InstallerMessage "Starting $ServiceName..."
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(60))
+        return $true
+    } catch {
+        Write-InstallerMessage "Failed to start $ServiceName after install: $($_.Exception.Message)" -Level "WARN"
+        return $false
+    }
 }
 
 function Copy-DirectoryAccessRules {
@@ -331,12 +377,12 @@ function Resolve-PackagePath {
         return $destinationPackage
     }
 
-    Write-InstallerMessage "Downloading MailSite package from $PackageUrl to $destinationPackage..."
+    Write-InstallerMessage "Downloading MailSite package to $destinationPackage..."
     try {
         Invoke-WebRequest -Uri $PackageUrl -OutFile $destinationPackage -UseBasicParsing
         return $destinationPackage
     } catch {
-        throw "Could not download MailSite package from $PackageUrl. Pass -PackagePath or publish MailSite.zip to the release repository. $($_.Exception.Message)"
+        throw "Could not download MailSite package. Pass -PackagePath or publish MailSite.zip to the release repository. $($_.Exception.Message)"
     }
 }
 
@@ -516,10 +562,16 @@ function Set-MailSiteFirewallRules {
         throw "Windows firewall cmdlets are not available on this system."
     }
 
-    $directions = @("Inbound")
     if ($Service.Name -eq "SMTPDA") {
-        $directions += "Outbound"
+        $directions = @("Outbound")
+        $obsoleteDisplayName = "MailSite 11 SMTPDA Inbound"
+        $obsoleteRules = Get-NetFirewallRule -DisplayName $obsoleteDisplayName -ErrorAction SilentlyContinue
+        if ($obsoleteRules) {
+            $obsoleteRules | Remove-NetFirewallRule | Out-Null
+            Write-InstallerMessage "Removed obsolete firewall rule '$obsoleteDisplayName'."
+        }
     } else {
+        $directions = @("Inbound")
         $obsoleteDisplayName = "MailSite 11 $($Service.Name) Outbound"
         $obsoleteRules = Get-NetFirewallRule -DisplayName $obsoleteDisplayName -ErrorAction SilentlyContinue
         if ($obsoleteRules) {
@@ -620,6 +672,7 @@ function Install-MailSite {
             InstallDir11 = $InstallDir
             TargetVersion = $targetVersion
             PreviousImagePath = Copy-StateMap -State $existingState -PropertyName "PreviousImagePath"
+            PreviousDescription = Copy-StateMap -State $existingState -PropertyName "PreviousDescription"
             WasRunning = @{}
         }
 
@@ -628,6 +681,9 @@ function Install-MailSite {
             $rollbackImagePath[$service.Name] = $currentImagePath
             if (-not $state.PreviousImagePath.ContainsKey($service.Name)) {
                 $state.PreviousImagePath[$service.Name] = $currentImagePath
+            }
+            if (-not $state.PreviousDescription.ContainsKey($service.Name)) {
+                $state.PreviousDescription[$service.Name] = Get-ServiceDescription -ServiceName $service.Name
             }
             $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
         }
@@ -646,19 +702,41 @@ function Install-MailSite {
                 throw "Package did not install $newExe."
             }
             Set-ServiceImagePath -ServiceName $service.Name -ExecutablePath $newExe
+            Set-ServiceDescription -ServiceName $service.Name -Description $service.Description
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
-        Write-InstallerMessage "MailSite $targetVersion installation completed successfully. Services were left stopped; start them manually after verification."
+
+        $restartRequested = @()
+        $restartFailures = @()
+        foreach ($service in $Services) {
+            if ($state.WasRunning[$service.Name]) {
+                $restartRequested += $service.Name
+                if (-not (Start-MailSiteService -ServiceName $service.Name)) {
+                    $restartFailures += $service.Name
+                }
+            }
+        }
+
+        if ($restartFailures.Count -gt 0) {
+            Write-InstallerMessage "MailSite $targetVersion installation completed, but these previously running services could not be restarted: $($restartFailures -join ', ')." -Level "WARN"
+        } elseif ($restartRequested.Count -gt 0) {
+            Write-InstallerMessage "MailSite $targetVersion installation completed successfully. Restarted previously running services: $($restartRequested -join ', ')."
+        } else {
+            Write-InstallerMessage "MailSite $targetVersion installation completed successfully. No services were running before install."
+        }
     } catch {
         if ($servicesStopped -and $null -ne $state) {
-            Write-InstallerMessage "Install failed. Restoring previous service paths..." -Level "WARN"
+            Write-InstallerMessage "Install failed. Restoring previous service paths and descriptions..." -Level "WARN"
             foreach ($service in $Services) {
                 $previous = $rollbackImagePath[$service.Name]
                 if (-not [string]::IsNullOrWhiteSpace($previous)) {
                     $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
                     Set-ItemProperty -Path $path -Name ImagePath -Value $previous
+                }
+                if ($state.PreviousDescription.ContainsKey($service.Name)) {
+                    Set-ServiceDescription -ServiceName $service.Name -Description $state.PreviousDescription[$service.Name]
                 }
             }
         }
