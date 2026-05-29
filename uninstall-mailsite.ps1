@@ -55,134 +55,24 @@ function Write-UninstallerFailure {
     }
 }
 
-function Test-TuiMenuSupported {
-    try {
-        return (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected)
-    } catch {
-        return $false
-    }
-}
-
-function Get-TuiConsoleWidth {
-    try {
-        if ([Console]::WindowWidth -gt 20) {
-            return [Console]::WindowWidth
-        }
-    } catch {
-    }
-
-    return 100
-}
-
-function Write-TuiLine {
-    param([string]$Line)
-
-    $width = Get-TuiConsoleWidth
-    if ($width -lt 2) {
-        $width = 100
-    }
-
-    $text = [string]$Line
-    if ($text.Length -gt ($width - 1)) {
-        $text = $text.Substring(0, $width - 1)
-    }
-
-    Write-Host $text.PadRight($width - 1)
-}
-
-function Read-TuiMenuFallback {
+function Read-YesNo {
     param(
-        [string]$Title,
-        [string[]]$Lines,
-        [string[]]$Options,
-        [int]$DefaultIndex = 0
+        [string]$Prompt,
+        [bool]$DefaultYes
     )
 
-    Write-Host ""
-    Write-Host $Title
-    Write-Host ("=" * $Title.Length)
-    foreach ($line in $Lines) {
-        Write-Host $line
-    }
-    Write-Host ""
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ("  {0}. {1}" -f ($i + 1), $Options[$i])
-    }
-
+    $suffix = if ($DefaultYes) { "[Y/n]" } else { "[y/N]" }
     while ($true) {
-        $answer = Read-Host ("Choose [1-{0}] default {1}" -f $Options.Count, ($DefaultIndex + 1))
+        $answer = Read-Host "$Prompt $suffix"
         if ([string]::IsNullOrWhiteSpace($answer)) {
-            return $DefaultIndex
+            return $DefaultYes
         }
 
-        $choice = 0
-        if ([int]::TryParse($answer.Trim(), [ref]$choice) -and $choice -ge 1 -and $choice -le $Options.Count) {
-            return ($choice - 1)
+        switch -Regex ($answer.Trim()) {
+            "^(y|yes)$" { return $true }
+            "^(n|no)$" { return $false }
+            default { Write-Host "Please enter y or n." -ForegroundColor Yellow }
         }
-
-        Write-Host "Please enter a number from 1 to $($Options.Count)." -ForegroundColor Yellow
-    }
-}
-
-function Read-TuiMenu {
-    param(
-        [string]$Title,
-        [string[]]$Lines,
-        [string[]]$Options,
-        [int]$DefaultIndex = 0
-    )
-
-    if ($Options.Count -eq 0) {
-        throw "TUI menu requires at least one option."
-    }
-    if ($DefaultIndex -lt 0 -or $DefaultIndex -ge $Options.Count) {
-        $DefaultIndex = 0
-    }
-    if (-not (Test-TuiMenuSupported)) {
-        return Read-TuiMenuFallback -Title $Title -Lines $Lines -Options $Options -DefaultIndex $DefaultIndex
-    }
-
-    try {
-        $selected = $DefaultIndex
-        $top = [Console]::CursorTop
-        while ($true) {
-            [Console]::SetCursorPosition(0, $top)
-            Write-TuiLine ""
-            Write-TuiLine $Title
-            Write-TuiLine ("=" * $Title.Length)
-            foreach ($line in $Lines) {
-                Write-TuiLine $line
-            }
-            Write-TuiLine ""
-            for ($i = 0; $i -lt $Options.Count; $i++) {
-                $prefix = if ($i -eq $selected) { "  > " } else { "    " }
-                Write-TuiLine "$prefix$($Options[$i])"
-            }
-            Write-TuiLine ""
-            Write-TuiLine "Use Up/Down, Enter to select, Esc to cancel."
-
-            $key = [Console]::ReadKey($true)
-            switch ($key.Key) {
-                "UpArrow" {
-                    if ($selected -le 0) {
-                        $selected = $Options.Count - 1
-                    } else {
-                        $selected--
-                    }
-                }
-                "DownArrow" {
-                    $selected = ($selected + 1) % $Options.Count
-                }
-                "Enter" {
-                    return $selected
-                }
-                "Escape" {
-                    return ($Options.Count - 1)
-                }
-            }
-        }
-    } catch {
-        return Read-TuiMenuFallback -Title $Title -Lines $Lines -Options $Options -DefaultIndex $DefaultIndex
     }
 }
 
@@ -311,22 +201,20 @@ function Confirm-MailSiteUninstall {
         $targetVersion = "Unknown"
     }
 
-    $choice = Read-TuiMenu `
-        -Title "MailSite 11 Uninstaller" `
-        -Lines @(
-            "Installed MailSite 11: $targetVersion",
-            "Install directory:       $InstalledDirectory",
-            "",
-            "This will:",
-            "  - Stop MailSite services",
-            "  - Restore service paths to MailSite 10",
-            "  - Remove MailSite 11 files",
-            "  - Remove MailSite 11 firewall rules"
-        ) `
-        -Options @("Continue uninstall", "Cancel") `
-        -DefaultIndex 1
+    Write-Host ""
+    Write-Host "MailSite 11 Uninstaller"
+    Write-Host "======================="
+    Write-Host "Installed MailSite 11: $targetVersion"
+    Write-Host "Install directory:       $InstalledDirectory"
+    Write-Host ""
+    Write-Host "This will:"
+    Write-Host "  - Stop MailSite services"
+    Write-Host "  - Restore service paths to MailSite 10"
+    Write-Host "  - Remove MailSite 11 files"
+    Write-Host "  - Remove MailSite 11 firewall rules"
+    Write-Host ""
 
-    return ($choice -eq 0)
+    return Read-YesNo -Prompt "Continue uninstall?" -DefaultYes $false
 }
 
 function Uninstall-MailSite {
