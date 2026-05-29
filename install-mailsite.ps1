@@ -1,5 +1,7 @@
 [CmdletBinding()]
 param(
+    [Parameter(Position = 0)]
+    [string]$InstallTarget,
     [string]$InstallDir = (Join-Path $env:ProgramFiles "MailSite"),
     [string]$PackagePath,
     [string]$PackageUrl = "https://github.com/rockliffe/mailsite-server-release/raw/main/MailSite.zip"
@@ -260,14 +262,28 @@ function Get-ClusterVariantName {
     }
 }
 
-function Get-LatestRemotePackageVersion {
-    if ($PackageUrl -notmatch '^https://github\.com/([^/]+)/([^/]+)/raw/([^/]+)/MailSite\.zip$') {
+function Get-ReleaseRepositoryInfo {
+    if ($PackageUrl -notmatch '^https://github\.com/([^/]+)/([^/]+)/raw/([^/]+)/[^/]+\.zip$') {
         return $null
     }
 
-    $owner = $Matches[1]
-    $repo = $Matches[2]
-    $branch = $Matches[3]
+    return @{
+        Owner = $Matches[1]
+        Repo = $Matches[2]
+        Branch = $Matches[3]
+        RawBaseUrl = "https://github.com/$($Matches[1])/$($Matches[2])/raw/$($Matches[3])"
+    }
+}
+
+function Get-RemotePackageVersions {
+    $repoInfo = Get-ReleaseRepositoryInfo
+    if ($null -eq $repoInfo) {
+        return @()
+    }
+
+    $owner = $repoInfo.Owner
+    $repo = $repoInfo.Repo
+    $branch = $repoInfo.Branch
     $contentsUrl = "https://api.github.com/repos/$owner/$repo/contents?ref=$branch"
 
     try {
@@ -279,15 +295,35 @@ function Get-LatestRemotePackageVersion {
             }
         }
 
-        if ($versions.Count -eq 0) {
-            return $null
-        }
-
-        return (($versions | Sort-Object -Descending | Select-Object -First 1).ToString())
+        return @($versions | Sort-Object -Descending)
     } catch {
-        Write-InstallerMessage "Could not determine latest MailSite package version from release repository before download: $($_.Exception.Message)" -Level "WARN"
+        Write-InstallerMessage "Could not query MailSite package versions from release repository before download: $($_.Exception.Message)" -Level "WARN"
+        return @()
+    }
+}
+
+function Get-LatestRemotePackageVersion {
+    $versions = @(Get-RemotePackageVersions)
+    if ($versions.Count -eq 0) {
         return $null
     }
+
+    return ($versions[0].ToString())
+}
+
+function Get-RemotePackageUrl {
+    param([string]$Version)
+
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        return $PackageUrl
+    }
+
+    $repoInfo = Get-ReleaseRepositoryInfo
+    if ($null -eq $repoInfo) {
+        throw "Cannot resolve version-specific package URL from PackageUrl '$PackageUrl'. Pass -PackagePath or use the default release repository URL."
+    }
+
+    return "$($repoInfo.RawBaseUrl)/MailSite.$Version.zip"
 }
 
 function Assert-MailSite10 {
@@ -343,8 +379,56 @@ function Assert-MailSite10 {
     }
 }
 
+function Assert-ZipPackageValid {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "MailSite package does not exist: $Path"
+    }
+
+    $file = Get-Item -LiteralPath $Path
+    if ($file.Length -le 0) {
+        throw "MailSite package is empty: $Path"
+    }
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            if ($zip.Entries.Count -eq 0) {
+                throw "Zip archive contains no entries."
+            }
+        } finally {
+            $zip.Dispose()
+        }
+    } catch {
+        throw "MailSite package is not a valid zip file: $Path. $($_.Exception.Message)"
+    }
+}
+
+function Invoke-MailSitePackageDownload {
+    param(
+        [string]$Url,
+        [string]$DestinationPath
+    )
+
+    $curl = Get-Command -Name "curl.exe" -ErrorAction SilentlyContinue
+    if ($null -eq $curl) {
+        throw "curl.exe is required to download MailSite packages."
+    }
+
+    Write-InstallerMessage "Downloading MailSite package from $Url to $DestinationPath..."
+    & $curl.Source -f -# -L $Url -o $DestinationPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not download MailSite package from $Url. curl.exe exited with code $LASTEXITCODE."
+    }
+}
+
 function Resolve-PackagePath {
-    param([string]$DestinationDirectory)
+    param(
+        [string]$DestinationDirectory,
+        [string]$RemoteVersion
+    )
 
     $destinationPackage = Join-Path $DestinationDirectory "MailSite.zip"
 
@@ -354,13 +438,15 @@ function Resolve-PackagePath {
         }
         $resolvedPackage = (Resolve-Path -LiteralPath $PackagePath).Path
         if ($resolvedPackage -ne $destinationPackage) {
+            Remove-Item -LiteralPath $destinationPackage -Force -ErrorAction SilentlyContinue
             Write-InstallerMessage "Copying MailSite package to $destinationPackage..."
             Copy-Item -LiteralPath $resolvedPackage -Destination $destinationPackage -Force
         }
+        Assert-ZipPackageValid -Path $destinationPackage
         return $destinationPackage
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    if ([string]::IsNullOrWhiteSpace($RemoteVersion) -and -not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
         $sibling = Join-Path $PSScriptRoot "MailSite.zip"
         if (-not (Test-Path -LiteralPath $sibling)) {
             $sibling = $null
@@ -371,24 +457,29 @@ function Resolve-PackagePath {
 
     if (-not [string]::IsNullOrWhiteSpace($sibling)) {
         if ((Resolve-Path -LiteralPath $sibling).Path -ne $destinationPackage) {
+            Remove-Item -LiteralPath $destinationPackage -Force -ErrorAction SilentlyContinue
             Write-InstallerMessage "Copying MailSite package to $destinationPackage..."
             Copy-Item -LiteralPath $sibling -Destination $destinationPackage -Force
         }
+        Assert-ZipPackageValid -Path $destinationPackage
         return $destinationPackage
     }
 
-    Write-InstallerMessage "Downloading MailSite package to $destinationPackage..."
+    Remove-Item -LiteralPath $destinationPackage -Force -ErrorAction SilentlyContinue
+    $downloadUrl = Get-RemotePackageUrl -Version $RemoteVersion
     try {
-        Invoke-WebRequest -Uri $PackageUrl -OutFile $destinationPackage -UseBasicParsing
+        Invoke-MailSitePackageDownload -Url $downloadUrl -DestinationPath $destinationPackage
+        Assert-ZipPackageValid -Path $destinationPackage
         return $destinationPackage
     } catch {
-        throw "Could not download MailSite package. Pass -PackagePath or publish MailSite.zip to the release repository. $($_.Exception.Message)"
+        throw "Could not prepare MailSite package. Pass -PackagePath or publish the requested MailSite zip to the release repository. $($_.Exception.Message)"
     }
 }
 
 function Get-PackageVersionFromZip {
     param([string]$Path)
 
+    Assert-ZipPackageValid -Path $Path
     $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-version-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
     try {
@@ -400,12 +491,52 @@ function Get-PackageVersionFromZip {
     }
 }
 
+function Resolve-InstallRequest {
+    $target = $InstallTarget
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        return @{
+            RemoteVersion = $null
+            ForceReinstall = $false
+            AllowDowngrade = $false
+        }
+    }
+
+    $target = $target.Trim()
+    if ($target -ieq "reinstall") {
+        return @{
+            RemoteVersion = $null
+            ForceReinstall = $true
+            AllowDowngrade = $false
+        }
+    }
+
+    if ($target -match '^11\.[0-9]+\.[0-9]+$') {
+        return @{
+            RemoteVersion = $target
+            ForceReinstall = $false
+            AllowDowngrade = $true
+        }
+    }
+
+    throw "Unknown install target '$target'. Use no argument for latest, 'reinstall' to force latest reinstall, or an exact version such as 11.0.112."
+}
+
 function Resolve-RequestedPackageVersion {
+    param([hashtable]$InstallRequest)
+
     if (-not [string]::IsNullOrWhiteSpace($PackagePath)) {
         if (-not (Test-Path -LiteralPath $PackagePath)) {
             throw "PackagePath does not exist: $PackagePath"
         }
         return Get-PackageVersionFromZip -Path (Resolve-Path -LiteralPath $PackagePath).Path
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallRequest.RemoteVersion)) {
+        $versions = @(Get-RemotePackageVersions | ForEach-Object { $_.ToString() })
+        if ($versions.Count -gt 0 -and -not ($versions -contains $InstallRequest.RemoteVersion)) {
+            throw "MailSite $($InstallRequest.RemoteVersion) was not found in the release repository."
+        }
+        return $InstallRequest.RemoteVersion
     }
 
     if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
@@ -611,7 +742,8 @@ function Install-MailSite {
     $legacy = Assert-MailSite10
     Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
 
-    $requestedVersion = Resolve-RequestedPackageVersion
+    $installRequest = Resolve-InstallRequest
+    $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
     $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
     if (-not [string]::IsNullOrWhiteSpace($installedVersion)) {
         Write-InstallerMessage "Detected existing MailSite $installedVersion in $InstallDir."
@@ -619,11 +751,11 @@ function Install-MailSite {
 
     if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and (Test-ExactMailSiteVersion -Version $installedVersion)) {
         $requestedComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
-        if ($requestedComparison -eq 0) {
+        if ($requestedComparison -eq 0 -and -not $installRequest.ForceReinstall) {
             Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
             return
         }
-        if ($requestedComparison -lt 0) {
+        if ($requestedComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
             Write-InstallerMessage "MailSite $installedVersion is already installed, which is newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
             return
         }
@@ -634,7 +766,7 @@ function Install-MailSite {
         return
     }
 
-    $package = Resolve-PackagePath -DestinationDirectory $InstallDir
+    $package = Resolve-PackagePath -DestinationDirectory $InstallDir -RemoteVersion $installRequest.RemoteVersion
     $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
 
@@ -650,12 +782,12 @@ function Install-MailSite {
 
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
             $targetComparison = Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion
-            if ($targetComparison -eq 0) {
+            if ($targetComparison -eq 0 -and -not $installRequest.ForceReinstall) {
                 Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
                 Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
                 return
             }
-            if ($targetComparison -lt 0) {
+            if ($targetComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
                 throw "Cannot install MailSite $targetVersion because MailSite $installedVersion is already installed. Download a newer MailSite package and retry."
             }
         }
