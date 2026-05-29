@@ -61,6 +61,137 @@ function Write-InstallerFailure {
     }
 }
 
+function Test-TuiMenuSupported {
+    try {
+        return (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected)
+    } catch {
+        return $false
+    }
+}
+
+function Get-TuiConsoleWidth {
+    try {
+        if ([Console]::WindowWidth -gt 20) {
+            return [Console]::WindowWidth
+        }
+    } catch {
+    }
+
+    return 100
+}
+
+function Write-TuiLine {
+    param([string]$Line)
+
+    $width = Get-TuiConsoleWidth
+    if ($width -lt 2) {
+        $width = 100
+    }
+
+    $text = [string]$Line
+    if ($text.Length -gt ($width - 1)) {
+        $text = $text.Substring(0, $width - 1)
+    }
+
+    Write-Host $text.PadRight($width - 1)
+}
+
+function Read-TuiMenuFallback {
+    param(
+        [string]$Title,
+        [string[]]$Lines,
+        [string[]]$Options,
+        [int]$DefaultIndex = 0
+    )
+
+    Write-Host ""
+    Write-Host $Title
+    Write-Host ("=" * $Title.Length)
+    foreach ($line in $Lines) {
+        Write-Host $line
+    }
+    Write-Host ""
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host ("  {0}. {1}" -f ($i + 1), $Options[$i])
+    }
+
+    while ($true) {
+        $answer = Read-Host ("Choose [1-{0}] default {1}" -f $Options.Count, ($DefaultIndex + 1))
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $DefaultIndex
+        }
+
+        $choice = 0
+        if ([int]::TryParse($answer.Trim(), [ref]$choice) -and $choice -ge 1 -and $choice -le $Options.Count) {
+            return ($choice - 1)
+        }
+
+        Write-Host "Please enter a number from 1 to $($Options.Count)." -ForegroundColor Yellow
+    }
+}
+
+function Read-TuiMenu {
+    param(
+        [string]$Title,
+        [string[]]$Lines,
+        [string[]]$Options,
+        [int]$DefaultIndex = 0
+    )
+
+    if ($Options.Count -eq 0) {
+        throw "TUI menu requires at least one option."
+    }
+    if ($DefaultIndex -lt 0 -or $DefaultIndex -ge $Options.Count) {
+        $DefaultIndex = 0
+    }
+    if (-not (Test-TuiMenuSupported)) {
+        return Read-TuiMenuFallback -Title $Title -Lines $Lines -Options $Options -DefaultIndex $DefaultIndex
+    }
+
+    try {
+        $selected = $DefaultIndex
+        $top = [Console]::CursorTop
+        while ($true) {
+            [Console]::SetCursorPosition(0, $top)
+            Write-TuiLine ""
+            Write-TuiLine $Title
+            Write-TuiLine ("=" * $Title.Length)
+            foreach ($line in $Lines) {
+                Write-TuiLine $line
+            }
+            Write-TuiLine ""
+            for ($i = 0; $i -lt $Options.Count; $i++) {
+                $prefix = if ($i -eq $selected) { "  > " } else { "    " }
+                Write-TuiLine "$prefix$($Options[$i])"
+            }
+            Write-TuiLine ""
+            Write-TuiLine "Use Up/Down, Enter to select, Esc to cancel."
+
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                "UpArrow" {
+                    if ($selected -le 0) {
+                        $selected = $Options.Count - 1
+                    } else {
+                        $selected--
+                    }
+                }
+                "DownArrow" {
+                    $selected = ($selected + 1) % $Options.Count
+                }
+                "Enter" {
+                    return $selected
+                }
+                "Escape" {
+                    return ($Options.Count - 1)
+                }
+            }
+        }
+    } catch {
+        return Read-TuiMenuFallback -Title $Title -Lines $Lines -Options $Options -DefaultIndex $DefaultIndex
+    }
+}
+
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -697,11 +828,23 @@ function Read-YesNo {
 function Confirm-MailSiteInstall {
     param([string]$Version)
 
-    return Read-YesNo -Prompt "This script will install MailSite $Version. Do you wish to continue?" -DefaultYes $false
+    $choice = Read-TuiMenu `
+        -Title "MailSite 11 Installer" `
+        -Lines @(
+            "This script will install MailSite $Version.",
+            "Install directory: $InstallDir"
+        ) `
+        -Options @("Continue", "Cancel") `
+        -DefaultIndex 1
+
+    return ($choice -eq 0)
 }
 
 function Resolve-InteractiveRemoteInstallRequest {
-    param([string]$InstalledVersion)
+    param(
+        [string]$InstalledVersion,
+        [hashtable]$LegacyInfo
+    )
 
     $versions = @(Get-RemotePackageVersions)
     if ($versions.Count -eq 0) {
@@ -715,10 +858,24 @@ function Resolve-InteractiveRemoteInstallRequest {
     }
 
     Write-InstallerMessage "Latest available MailSite version: $latestVersion."
+    $summaryLines = @(
+        "Detected:",
+        "  MailSite 10:       $($LegacyInfo.RegistryVersion)",
+        "  Connector:         $($LegacyInfo.ConnectorName)",
+        "  Existing MailSite: $(if ([string]::IsNullOrWhiteSpace($InstalledVersion)) { 'Not installed' } else { $InstalledVersion })",
+        "  Install path:      $InstallDir",
+        "",
+        "Latest available:    $latestVersion"
+    )
     if ((Test-ExactMailSiteVersion -Version $latestVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
         $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $InstalledVersion
         if ($latestComparison -eq 0) {
-            if (Read-YesNo -Prompt "MailSite $latestVersion is already installed. Reinstall MailSite $($latestVersion)?" -DefaultYes $false) {
+            $choice = Read-TuiMenu `
+                -Title "MailSite 11 Installer" `
+                -Lines ($summaryLines + @("", "MailSite $latestVersion is already installed.")) `
+                -Options @("Yes, reinstall latest", "No") `
+                -DefaultIndex 1
+            if ($choice -eq 0) {
                 return @{
                     RemoteVersion = $latestVersion
                     ForceReinstall = $true
@@ -729,7 +886,12 @@ function Resolve-InteractiveRemoteInstallRequest {
                 }
             }
         } elseif ($latestComparison -gt 0) {
-            if (Read-YesNo -Prompt "Install MailSite $($latestVersion)?" -DefaultYes $true) {
+            $choice = Read-TuiMenu `
+                -Title "MailSite 11 Installer" `
+                -Lines ($summaryLines + @("", "Install MailSite $($latestVersion)?")) `
+                -Options @("Yes, install latest", "No") `
+                -DefaultIndex 0
+            if ($choice -eq 0) {
                 return @{
                     RemoteVersion = $latestVersion
                     ForceReinstall = $false
@@ -742,7 +904,13 @@ function Resolve-InteractiveRemoteInstallRequest {
         } else {
             Write-InstallerMessage "Installed MailSite $InstalledVersion is newer than the latest available package $latestVersion." -Level "WARN"
         }
-    } elseif (Read-YesNo -Prompt "Install MailSite $($latestVersion)?" -DefaultYes $true) {
+    } else {
+        $choice = Read-TuiMenu `
+            -Title "MailSite 11 Installer" `
+            -Lines ($summaryLines + @("", "Install MailSite $($latestVersion)?")) `
+            -Options @("Yes, install latest", "No") `
+            -DefaultIndex 0
+        if ($choice -eq 0) {
         return @{
             RemoteVersion = $latestVersion
             ForceReinstall = $false
@@ -751,10 +919,20 @@ function Resolve-InteractiveRemoteInstallRequest {
             SkipConfirm = $true
             Cancelled = $false
         }
+        }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($previousVersion)) {
-        if (Read-YesNo -Prompt "Install previous MailSite version $previousVersion instead?" -DefaultYes $false) {
+        $choice = Read-TuiMenu `
+            -Title "MailSite 11 Installer" `
+            -Lines @(
+                "Install previous version instead?",
+                "",
+                "Previous available: $previousVersion"
+            ) `
+            -Options @("Yes, install $previousVersion", "No, cancel") `
+            -DefaultIndex 1
+        if ($choice -eq 0) {
             return @{
                 RemoteVersion = $previousVersion
                 ForceReinstall = $true
@@ -860,7 +1038,7 @@ function Install-MailSite {
     }
 
     if ($installRequest.Interactive -and [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
-        $installRequest = Resolve-InteractiveRemoteInstallRequest -InstalledVersion $installedVersion
+        $installRequest = Resolve-InteractiveRemoteInstallRequest -InstalledVersion $installedVersion -LegacyInfo $legacy
         if ($installRequest.Cancelled) {
             return
         }
