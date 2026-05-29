@@ -311,6 +311,15 @@ function Get-LatestRemotePackageVersion {
     return ($versions[0].ToString())
 }
 
+function Test-SiblingPackageAvailable {
+    if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        return $false
+    }
+
+    $sibling = Join-Path $PSScriptRoot "MailSite.zip"
+    return (Test-Path -LiteralPath $sibling -PathType Leaf)
+}
+
 function Get-RemotePackageUrl {
     param([string]$Version)
 
@@ -498,6 +507,9 @@ function Resolve-InstallRequest {
             RemoteVersion = $null
             ForceReinstall = $false
             AllowDowngrade = $false
+            Interactive = $true
+            SkipConfirm = $false
+            Cancelled = $false
         }
     }
 
@@ -507,6 +519,9 @@ function Resolve-InstallRequest {
             RemoteVersion = $null
             ForceReinstall = $true
             AllowDowngrade = $false
+            Interactive = $false
+            SkipConfirm = $false
+            Cancelled = $false
         }
     }
 
@@ -515,6 +530,9 @@ function Resolve-InstallRequest {
             RemoteVersion = $target
             ForceReinstall = $false
             AllowDowngrade = $true
+            Interactive = $false
+            SkipConfirm = $false
+            Cancelled = $false
         }
     }
 
@@ -655,16 +673,109 @@ function Copy-StateMap {
     return $result
 }
 
-function Confirm-MailSiteInstall {
-    param([string]$Version)
+function Read-YesNo {
+    param(
+        [string]$Prompt,
+        [bool]$DefaultYes
+    )
 
+    $suffix = if ($DefaultYes) { "[Y/n]" } else { "[y/N]" }
     while ($true) {
-        $answer = Read-Host "This script will install MailSite $Version. Do you wish to continue [y/n]?"
+        $answer = Read-Host "$Prompt $suffix"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $DefaultYes
+        }
+
         switch -Regex ($answer.Trim()) {
             "^(y|yes)$" { return $true }
             "^(n|no)$" { return $false }
             default { Write-Host "Please enter y or n." -ForegroundColor Yellow }
         }
+    }
+}
+
+function Confirm-MailSiteInstall {
+    param([string]$Version)
+
+    return Read-YesNo -Prompt "This script will install MailSite $Version. Do you wish to continue?" -DefaultYes $false
+}
+
+function Resolve-InteractiveRemoteInstallRequest {
+    param([string]$InstalledVersion)
+
+    $versions = @(Get-RemotePackageVersions)
+    if ($versions.Count -eq 0) {
+        throw "Could not find MailSite packages in the release repository."
+    }
+
+    $latestVersion = $versions[0].ToString()
+    $previousVersion = $null
+    if ($versions.Count -gt 1) {
+        $previousVersion = $versions[1].ToString()
+    }
+
+    Write-InstallerMessage "Latest available MailSite version: $latestVersion."
+    if ((Test-ExactMailSiteVersion -Version $latestVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
+        $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $InstalledVersion
+        if ($latestComparison -eq 0) {
+            if (Read-YesNo -Prompt "MailSite $latestVersion is already installed. Reinstall MailSite $($latestVersion)?" -DefaultYes $false) {
+                return @{
+                    RemoteVersion = $latestVersion
+                    ForceReinstall = $true
+                    AllowDowngrade = $false
+                    Interactive = $true
+                    SkipConfirm = $true
+                    Cancelled = $false
+                }
+            }
+        } elseif ($latestComparison -gt 0) {
+            if (Read-YesNo -Prompt "Install MailSite $($latestVersion)?" -DefaultYes $true) {
+                return @{
+                    RemoteVersion = $latestVersion
+                    ForceReinstall = $false
+                    AllowDowngrade = $false
+                    Interactive = $true
+                    SkipConfirm = $true
+                    Cancelled = $false
+                }
+            }
+        } else {
+            Write-InstallerMessage "Installed MailSite $InstalledVersion is newer than the latest available package $latestVersion." -Level "WARN"
+        }
+    } elseif (Read-YesNo -Prompt "Install MailSite $($latestVersion)?" -DefaultYes $true) {
+        return @{
+            RemoteVersion = $latestVersion
+            ForceReinstall = $false
+            AllowDowngrade = $false
+            Interactive = $true
+            SkipConfirm = $true
+            Cancelled = $false
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($previousVersion)) {
+        if (Read-YesNo -Prompt "Install previous MailSite version $previousVersion instead?" -DefaultYes $false) {
+            return @{
+                RemoteVersion = $previousVersion
+                ForceReinstall = $true
+                AllowDowngrade = $true
+                Interactive = $true
+                SkipConfirm = $true
+                Cancelled = $false
+            }
+        }
+    } else {
+        Write-InstallerMessage "No previous MailSite package is available in the release repository." -Level "WARN"
+    }
+
+    Write-InstallerMessage "Installation cancelled by user."
+    return @{
+        RemoteVersion = $null
+        ForceReinstall = $false
+        AllowDowngrade = $false
+        Interactive = $true
+        SkipConfirm = $true
+        Cancelled = $true
     }
 }
 
@@ -743,10 +854,19 @@ function Install-MailSite {
     Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
 
     $installRequest = Resolve-InstallRequest
-    $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
     $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
     if (-not [string]::IsNullOrWhiteSpace($installedVersion)) {
         Write-InstallerMessage "Detected existing MailSite $installedVersion in $InstallDir."
+    }
+
+    if ($installRequest.Interactive -and [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
+        $installRequest = Resolve-InteractiveRemoteInstallRequest -InstalledVersion $installedVersion
+        if ($installRequest.Cancelled) {
+            return
+        }
+        $requestedVersion = $installRequest.RemoteVersion
+    } else {
+        $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
     }
 
     if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and (Test-ExactMailSiteVersion -Version $installedVersion)) {
@@ -761,7 +881,7 @@ function Install-MailSite {
         }
     }
 
-    if (-not (Confirm-MailSiteInstall -Version $requestedVersion)) {
+    if (-not $installRequest.SkipConfirm -and -not (Confirm-MailSiteInstall -Version $requestedVersion)) {
         Write-InstallerMessage "Installation cancelled by user."
         return
     }
