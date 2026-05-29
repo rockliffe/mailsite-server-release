@@ -740,7 +740,7 @@ function Resolve-InteractiveRemoteInstallRequest {
         $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $InstalledVersion
         if ($latestComparison -eq 0) {
             Write-Host "MailSite $latestVersion is already installed."
-            if (Read-YesNo -Prompt "Reinstall MailSite $($latestVersion)?" -DefaultYes $false) {
+            if (Read-YesNo -Prompt "Reinstall MailSite $($latestVersion)?" -DefaultYes $true) {
                 return @{
                     RemoteVersion = $latestVersion
                     ForceReinstall = $true
