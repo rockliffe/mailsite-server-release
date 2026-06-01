@@ -170,7 +170,7 @@ function Remove-MailSiteFirewallRules {
 
     foreach ($service in $Services) {
         foreach ($direction in @("Inbound", "Outbound")) {
-            $displayName = "MailSite 11 $($service.Name) $direction"
+            $displayName = "MailSite $($service.Name) $direction"
             $rules = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
             if ($rules) {
                 $rules | Remove-NetFirewallRule | Out-Null

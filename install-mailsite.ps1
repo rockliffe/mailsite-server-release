@@ -695,7 +695,10 @@ function Read-YesNo {
 }
 
 function Confirm-MailSiteInstall {
-    param([string]$Version)
+    param(
+        [string]$Version,
+        [string]$InstalledVersion
+    )
 
     Write-Host ""
     Write-Host "MailSite 11 Installer"
@@ -703,7 +706,28 @@ function Confirm-MailSiteInstall {
     Write-Host "This script will install MailSite $Version."
     Write-Host "Install directory: $InstallDir"
     Write-Host ""
-    return Read-YesNo -Prompt "Continue?" -DefaultYes $false
+    $prompt = Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $Version
+    return Read-YesNo -Prompt $prompt -DefaultYes $false
+}
+
+function Get-MailSiteInstallPrompt {
+    param(
+        [string]$InstalledVersion,
+        [string]$TargetVersion
+    )
+
+    if ((Test-ExactMailSiteVersion -Version $InstalledVersion) -and (Test-ExactMailSiteVersion -Version $TargetVersion)) {
+        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $InstalledVersion
+        if ($comparison -eq 0) {
+            return "Reinstall MailSite ${TargetVersion}?"
+        }
+        if ($comparison -gt 0) {
+            return "Upgrade from MailSite $InstalledVersion to MailSite ${TargetVersion}?"
+        }
+        return "Downgrade from MailSite $InstalledVersion to MailSite ${TargetVersion}?"
+    }
+
+    return "Install MailSite ${TargetVersion}?"
 }
 
 function Resolve-InteractiveRemoteInstallRequest {
@@ -724,23 +748,12 @@ function Resolve-InteractiveRemoteInstallRequest {
     }
 
     Write-InstallerMessage "Latest available MailSite version: $latestVersion."
-    Write-Host ""
-    Write-Host "MailSite 11 Installer"
-    Write-Host "====================="
-    Write-Host "Detected:"
-    Write-Host "  MailSite 10:       $($LegacyInfo.RegistryVersion)"
-    Write-Host "  Connector:         $($LegacyInfo.ConnectorName)"
-    Write-Host "  Existing MailSite: $(if ([string]::IsNullOrWhiteSpace($InstalledVersion)) { 'Not installed' } else { $InstalledVersion })"
-    Write-Host "  Install path:      $InstallDir"
-    Write-Host ""
-    Write-Host "Latest available:    $latestVersion"
-    Write-Host ""
 
     if ((Test-ExactMailSiteVersion -Version $latestVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
         $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $InstalledVersion
         if ($latestComparison -eq 0) {
             Write-Host "MailSite $latestVersion is already installed."
-            if (Read-YesNo -Prompt "Reinstall MailSite $($latestVersion)?" -DefaultYes $true) {
+            if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
                 return @{
                     RemoteVersion = $latestVersion
                     ForceReinstall = $true
@@ -751,7 +764,7 @@ function Resolve-InteractiveRemoteInstallRequest {
                 }
             }
         } elseif ($latestComparison -gt 0) {
-            if (Read-YesNo -Prompt "Install MailSite $($latestVersion)?" -DefaultYes $true) {
+            if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
                 return @{
                     RemoteVersion = $latestVersion
                     ForceReinstall = $false
@@ -765,15 +778,15 @@ function Resolve-InteractiveRemoteInstallRequest {
             Write-InstallerMessage "Installed MailSite $InstalledVersion is newer than the latest available package $latestVersion." -Level "WARN"
         }
     } else {
-        if (Read-YesNo -Prompt "Install MailSite $($latestVersion)?" -DefaultYes $true) {
-        return @{
-            RemoteVersion = $latestVersion
-            ForceReinstall = $false
-            AllowDowngrade = $false
-            Interactive = $true
-            SkipConfirm = $true
-            Cancelled = $false
-        }
+        if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
+            return @{
+                RemoteVersion = $latestVersion
+                ForceReinstall = $false
+                AllowDowngrade = $false
+                Interactive = $true
+                SkipConfirm = $true
+                Cancelled = $false
+            }
         }
     }
 
@@ -781,7 +794,7 @@ function Resolve-InteractiveRemoteInstallRequest {
         Write-Host ""
         Write-Host "Install previous version instead?"
         Write-Host "Previous available: $previousVersion"
-        if (Read-YesNo -Prompt "Install MailSite $($previousVersion)?" -DefaultYes $false) {
+        if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $previousVersion) -DefaultYes $false) {
             return @{
                 RemoteVersion = $previousVersion
                 ForceReinstall = $true
@@ -833,24 +846,12 @@ function Set-MailSiteFirewallRules {
 
     if ($Service.Name -eq "SMTPDA") {
         $directions = @("Outbound")
-        $obsoleteDisplayName = "MailSite 11 SMTPDA Inbound"
-        $obsoleteRules = Get-NetFirewallRule -DisplayName $obsoleteDisplayName -ErrorAction SilentlyContinue
-        if ($obsoleteRules) {
-            $obsoleteRules | Remove-NetFirewallRule | Out-Null
-            Write-InstallerMessage "Removed obsolete firewall rule '$obsoleteDisplayName'."
-        }
     } else {
         $directions = @("Inbound")
-        $obsoleteDisplayName = "MailSite 11 $($Service.Name) Outbound"
-        $obsoleteRules = Get-NetFirewallRule -DisplayName $obsoleteDisplayName -ErrorAction SilentlyContinue
-        if ($obsoleteRules) {
-            $obsoleteRules | Remove-NetFirewallRule | Out-Null
-            Write-InstallerMessage "Removed obsolete firewall rule '$obsoleteDisplayName'."
-        }
     }
 
     foreach ($direction in $directions) {
-        $displayName = "MailSite 11 $($Service.Name) $direction"
+        $displayName = "MailSite $($Service.Name) $direction"
         $existingRules = Get-NetFirewallRule -DisplayName $displayName -ErrorAction SilentlyContinue
         if ($existingRules) {
             foreach ($rule in $existingRules) {
@@ -908,7 +909,7 @@ function Install-MailSite {
         }
     }
 
-    if (-not $installRequest.SkipConfirm -and -not (Confirm-MailSiteInstall -Version $requestedVersion)) {
+    if (-not $installRequest.SkipConfirm -and -not (Confirm-MailSiteInstall -Version $requestedVersion -InstalledVersion $installedVersion)) {
         Write-InstallerMessage "Installation cancelled by user."
         return
     }
