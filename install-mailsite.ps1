@@ -694,6 +694,38 @@ function Read-YesNo {
     }
 }
 
+function Read-MailSiteVersionChoice {
+    param(
+        [string]$InstalledVersion,
+        [string[]]$Versions
+    )
+
+    if ($Versions.Count -eq 0) {
+        return $null
+    }
+
+    Write-Host ""
+    if (Test-ExactMailSiteVersion -Version $InstalledVersion) {
+        Write-Host "You are running $InstalledVersion. Other versions available:  $($Versions -join ', ')"
+    } else {
+        Write-Host "Other versions available:  $($Versions -join ', ')"
+    }
+
+    while ($true) {
+        $answer = Read-Host "Enter the version you would like to install (blank to cancel)"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $null
+        }
+
+        $candidate = $answer.Trim()
+        if ($Versions -contains $candidate) {
+            return $candidate
+        }
+
+        Write-Host "Please enter one of: $($Versions -join ', ')." -ForegroundColor Yellow
+    }
+}
+
 function Confirm-MailSiteInstall {
     param(
         [string]$Version,
@@ -730,6 +762,68 @@ function Get-MailSiteInstallPrompt {
     return "Install MailSite ${TargetVersion}?"
 }
 
+function New-InteractiveRemoteInstallRequest {
+    param(
+        [string]$TargetVersion,
+        [string]$InstalledVersion
+    )
+
+    $forceReinstall = $false
+    $allowDowngrade = $false
+    if ((Test-ExactMailSiteVersion -Version $TargetVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
+        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $InstalledVersion
+        $forceReinstall = ($comparison -eq 0)
+        $allowDowngrade = ($comparison -lt 0)
+    }
+
+    return @{
+        RemoteVersion = $TargetVersion
+        ForceReinstall = $forceReinstall
+        AllowDowngrade = $allowDowngrade
+        Interactive = $true
+        SkipConfirm = $true
+        Cancelled = $false
+    }
+}
+
+function Get-AlternativeRemotePackageVersions {
+    param(
+        [object[]]$Versions,
+        [string]$InstalledVersion,
+        [bool]$IncludeLatest = $false
+    )
+
+    if ($Versions.Count -eq 0) {
+        return @()
+    }
+
+    $skipCount = if ($IncludeLatest) { 0 } else { 1 }
+    $availableVersions = @($Versions | Select-Object -Skip $skipCount | ForEach-Object { $_.ToString() })
+    if (-not (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
+        return $availableVersions
+    }
+
+    $selectedVersions = @()
+    $olderThanInstalledCount = 0
+    foreach ($version in $availableVersions) {
+        if (-not (Test-ExactMailSiteVersion -Version $version)) {
+            continue
+        }
+
+        $comparison = Compare-MailSiteVersions -Left $version -Right $InstalledVersion
+        if ($comparison -lt 0) {
+            $olderThanInstalledCount += 1
+            if ($olderThanInstalledCount -gt 2) {
+                continue
+            }
+        }
+
+        $selectedVersions += $version
+    }
+
+    return $selectedVersions
+}
+
 function Resolve-InteractiveRemoteInstallRequest {
     param(
         [string]$InstalledVersion,
@@ -742,70 +836,39 @@ function Resolve-InteractiveRemoteInstallRequest {
     }
 
     $latestVersion = $versions[0].ToString()
-    $previousVersion = $null
-    if ($versions.Count -gt 1) {
-        $previousVersion = $versions[1].ToString()
-    }
 
     Write-InstallerMessage "Latest available MailSite version: $latestVersion."
+    $includeLatestInAlternatives = $false
 
     if ((Test-ExactMailSiteVersion -Version $latestVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
         $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $InstalledVersion
         if ($latestComparison -eq 0) {
             Write-Host "MailSite $latestVersion is already installed."
             if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
-                return @{
-                    RemoteVersion = $latestVersion
-                    ForceReinstall = $true
-                    AllowDowngrade = $false
-                    Interactive = $true
-                    SkipConfirm = $true
-                    Cancelled = $false
-                }
+                return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion
             }
         } elseif ($latestComparison -gt 0) {
             if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
-                return @{
-                    RemoteVersion = $latestVersion
-                    ForceReinstall = $false
-                    AllowDowngrade = $false
-                    Interactive = $true
-                    SkipConfirm = $true
-                    Cancelled = $false
-                }
+                return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion
             }
         } else {
             Write-InstallerMessage "Installed MailSite $InstalledVersion is newer than the latest available package $latestVersion." -Level "WARN"
+            $includeLatestInAlternatives = $true
         }
     } else {
         if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
-            return @{
-                RemoteVersion = $latestVersion
-                ForceReinstall = $false
-                AllowDowngrade = $false
-                Interactive = $true
-                SkipConfirm = $true
-                Cancelled = $false
-            }
+            return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion
         }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($previousVersion)) {
-        Write-Host ""
-        Write-Host "Install previous version instead?"
-        Write-Host "Previous available: $previousVersion"
-        if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $previousVersion) -DefaultYes $false) {
-            return @{
-                RemoteVersion = $previousVersion
-                ForceReinstall = $true
-                AllowDowngrade = $true
-                Interactive = $true
-                SkipConfirm = $true
-                Cancelled = $false
-            }
+    $alternativeVersions = @(Get-AlternativeRemotePackageVersions -Versions $versions -InstalledVersion $InstalledVersion -IncludeLatest $includeLatestInAlternatives)
+    if ($alternativeVersions.Count -gt 0) {
+        $selectedVersion = Read-MailSiteVersionChoice -InstalledVersion $InstalledVersion -Versions $alternativeVersions
+        if (-not [string]::IsNullOrWhiteSpace($selectedVersion)) {
+            return New-InteractiveRemoteInstallRequest -TargetVersion $selectedVersion -InstalledVersion $InstalledVersion
         }
     } else {
-        Write-InstallerMessage "No previous MailSite package is available in the release repository." -Level "WARN"
+        Write-InstallerMessage "No other MailSite packages are available in the release repository." -Level "WARN"
     }
 
     Write-InstallerMessage "Installation cancelled by user."
@@ -907,6 +970,9 @@ function Install-MailSite {
             Write-InstallerMessage "MailSite $installedVersion is already installed, which is newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
             return
         }
+        if ($requestedComparison -lt 0) {
+            Write-InstallerMessage "Downgrading MailSite only replaces binaries; SQLite database schemas are not rolled back. Verify MailSite $requestedVersion can read any schema changes already applied by MailSite $installedVersion." -Level "WARN"
+        }
     }
 
     if (-not $installRequest.SkipConfirm -and -not (Confirm-MailSiteInstall -Version $requestedVersion -InstalledVersion $installedVersion)) {
@@ -937,6 +1003,9 @@ function Install-MailSite {
             }
             if ($targetComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
                 throw "Cannot install MailSite $targetVersion because MailSite $installedVersion is already installed. Download a newer MailSite package and retry."
+            }
+            if ($targetComparison -lt 0) {
+                Write-InstallerMessage "Continuing with downgrade from MailSite $installedVersion to MailSite $targetVersion." -Level "WARN"
             }
         }
 
