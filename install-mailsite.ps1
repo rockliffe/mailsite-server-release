@@ -429,7 +429,7 @@ function Invoke-MailSitePackageDownload {
         throw "curl.exe is required to download MailSite packages."
     }
 
-    Write-InstallerMessage "Downloading MailSite package from $Url to $DestinationPath..."
+    Write-InstallerMessage "Downloading MailSite package to $DestinationPath..."
     & $curl.Source -f -# -L $Url -o $DestinationPath
     if ($LASTEXITCODE -ne 0) {
         throw "Could not download MailSite package from $Url. curl.exe exited with code $LASTEXITCODE."
@@ -707,7 +707,6 @@ function Read-MailSiteVersionChoice {
         return $null
     }
 
-    Write-Host ""
     if (Test-ExactMailSiteVersion -Version $InstalledVersion) {
         Write-Host "You are running $InstalledVersion. Other versions available:  $($Versions -join ', ')"
     } else {
