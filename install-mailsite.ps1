@@ -229,7 +229,10 @@ function Get-ProductVersion {
     if (-not [string]::IsNullOrWhiteSpace($versionInfo.FileVersion)) {
         return $versionInfo.FileVersion.Trim()
     }
-    return $versionInfo.ProductVersion.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($versionInfo.ProductVersion)) {
+        return $versionInfo.ProductVersion.Trim()
+    }
+    throw "Executable $Path has no FileVersion/ProductVersion resource."
 }
 
 function ConvertTo-MailSiteDisplayVersion {
