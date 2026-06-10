@@ -938,6 +938,27 @@ function Set-MailSiteFirewallRules {
     }
 }
 
+function Remove-InstalledExpressProDist {
+    param(
+        [string]$PackageRoot,
+        [string]$DestinationRoot
+    )
+
+    $packageDist = Join-Path $PackageRoot "WebServices\ExpressPro\dist"
+    if (-not (Test-Path -LiteralPath $packageDist -PathType Container)) {
+        Write-InstallerMessage "Package does not include ExpressPro dist folder; skipping frontend cleanup." -Level "WARN"
+        return
+    }
+
+    $installedDist = Join-Path $DestinationRoot "WebServices\ExpressPro\dist"
+    if (-not (Test-Path -LiteralPath $installedDist -PathType Container)) {
+        return
+    }
+
+    Write-InstallerMessage "Removing old ExpressPro dist files from $installedDist..."
+    Remove-Item -LiteralPath $installedDist -Recurse -Force
+}
+
 function Install-MailSite {
     Assert-Administrator
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -1043,6 +1064,7 @@ function Install-MailSite {
         Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."
         Copy-DirectoryAccessRules -SourceDirectory $legacy.LegacyInstallDir -DestinationDirectory $InstallDir
 
+        Remove-InstalledExpressProDist -PackageRoot $packageRoot -DestinationRoot $InstallDir
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
 
         Save-InstallerState -State $state
