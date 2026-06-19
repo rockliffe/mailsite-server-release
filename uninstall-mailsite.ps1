@@ -140,11 +140,9 @@ function Resolve-UninstallServiceImagePath {
         }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($SavedImagePath)) {
-        return $SavedImagePath
-    }
-
-    throw "Cannot determine restore path for service $($Service.Name)."
+    # No MailSite 10 binary exists at the saved path or the legacy install dir,
+    # so the service cannot be reverted to MailSite 10. The caller reports this.
+    return $null
 }
 
 function Stop-MailSiteService {
@@ -227,6 +225,30 @@ function Uninstall-MailSite {
         $installedDir = $InstallDir
     }
 
+    # Resolve where each service reverts to (its MailSite 10 binary) before making
+    # any changes. If MailSite 10 has been removed there is nothing to revert to,
+    # so notify the user and stop rather than leaving the services half-reverted.
+    $restorePaths = @{}
+    $unrevertable = @()
+    foreach ($service in $Services) {
+        $previous = $state.PreviousImagePath.($service.Name)
+        $restorePath = Resolve-UninstallServiceImagePath -Service $service -SavedImagePath $previous
+        if ([string]::IsNullOrWhiteSpace($restorePath)) {
+            $unrevertable += $service.Name
+        } else {
+            $restorePaths[$service.Name] = $restorePath
+        }
+    }
+    if ($unrevertable.Count -gt 0) {
+        $legacyDir = Get-RegistryString -Path $MailSiteKey32 -Name "InstallDir"
+        Write-UninstallerMessage "MailSite 10 is no longer present, so the uninstaller cannot revert these services to it: $($unrevertable -join ', ')." -Level "WARN"
+        if (-not [string]::IsNullOrWhiteSpace($legacyDir)) {
+            Write-UninstallerMessage "Restore the MailSite 10 installation (expected at '$legacyDir') and run uninstall again." -Level "WARN"
+        }
+        Write-UninstallerMessage "No changes were made." -Level "WARN"
+        return
+    }
+
     if (-not (Confirm-MailSiteUninstall -State $state -InstalledDirectory $installedDir)) {
         Write-UninstallerMessage "Uninstall cancelled by user."
         return
@@ -237,11 +259,9 @@ function Uninstall-MailSite {
     }
 
     foreach ($service in $Services) {
-        $previous = $state.PreviousImagePath.($service.Name)
-        $restorePath = Resolve-UninstallServiceImagePath -Service $service -SavedImagePath $previous
         $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
-        Set-ItemProperty -Path $path -Name ImagePath -Value $restorePath
-        Write-UninstallerMessage "Restored $($service.Name) service path to $restorePath."
+        Set-ItemProperty -Path $path -Name ImagePath -Value $restorePaths[$service.Name]
+        Write-UninstallerMessage "Restored $($service.Name) service path to $($restorePaths[$service.Name])."
     }
 
     Remove-MailSiteFirewallRules
