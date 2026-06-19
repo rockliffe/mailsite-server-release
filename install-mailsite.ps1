@@ -964,14 +964,27 @@ function Install-MailSite {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Initialize-InstallLog -RootDirectory $InstallDir
 
-    $legacy = Assert-MailSite10
-    Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
+    $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
+    if ([string]::IsNullOrWhiteSpace($installedVersion)) {
+        # No existing MailSite 11: this is a first-time MailSite 10 -> 11 migration,
+        # so a valid MailSite 10 install is required to migrate from.
+        $legacy = Assert-MailSite10
+        Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
+    } else {
+        Write-InstallerMessage "Detected existing MailSite $installedVersion in $InstallDir."
+        # Upgrading an existing MailSite 11 install. MailSite 10 may have been
+        # removed; use it for permission copying if it's still present, but don't
+        # block the upgrade on it.
+        try {
+            $legacy = Assert-MailSite10
+            Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
+        } catch {
+            $legacy = $null
+            Write-InstallerMessage "MailSite 10 is no longer present; performing a MailSite 11 binary upgrade. Rollback to MailSite 10 will not be available." -Level "WARN"
+        }
+    }
 
     $installRequest = Resolve-InstallRequest
-    $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
-    if (-not [string]::IsNullOrWhiteSpace($installedVersion)) {
-        Write-InstallerMessage "Detected existing MailSite $installedVersion in $InstallDir."
-    }
 
     if ($installRequest.Interactive -and [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
         $installRequest = Resolve-InteractiveRemoteInstallRequest -InstalledVersion $installedVersion -LegacyInfo $legacy
@@ -1061,8 +1074,10 @@ function Install-MailSite {
         }
         $servicesStopped = $true
 
-        Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."
-        Copy-DirectoryAccessRules -SourceDirectory $legacy.LegacyInstallDir -DestinationDirectory $InstallDir
+        if ($legacy -and -not [string]::IsNullOrWhiteSpace($legacy.LegacyInstallDir) -and (Test-Path -LiteralPath $legacy.LegacyInstallDir)) {
+            Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."
+            Copy-DirectoryAccessRules -SourceDirectory $legacy.LegacyInstallDir -DestinationDirectory $InstallDir
+        }
 
         Remove-InstalledExpressProDist -PackageRoot $packageRoot -DestinationRoot $InstallDir
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
