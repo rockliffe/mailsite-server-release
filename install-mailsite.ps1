@@ -16,6 +16,11 @@ $Services = @(
     @{ Name = "SMTPDA"; File = "smtpda.exe"; Description = "MailSite SMTP Delivery Agent" }
 )
 
+$DesktopApps = @(
+    @{ Name = "ExpressPro"; File = "expresspro.exe" },
+    @{ Name = "Console"; File = "console.exe" }
+)
+
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallMarkerName = ".mailsite11-install.json"
 $RequiredLegacyMajorVersion = "10"
@@ -191,6 +196,39 @@ function Start-MailSiteService {
     } catch {
         Write-InstallerMessage "Failed to start $ServiceName after install: $($_.Exception.Message)" -Level "WARN"
         return $false
+    }
+}
+
+function Stop-MailSiteDesktopApps {
+    param([string]$RootDirectory)
+
+    foreach ($app in $DesktopApps) {
+        $exePath = Join-Path $RootDirectory $app.File
+        $processName = [IO.Path]::GetFileNameWithoutExtension($app.File)
+        $processes = @(
+            Get-Process -Name $processName -ErrorAction SilentlyContinue |
+                Where-Object {
+                    try {
+                        [string]::Equals($_.Path, $exePath, [StringComparison]::OrdinalIgnoreCase)
+                    } catch {
+                        $false
+                    }
+                }
+        )
+
+        if ($processes.Count -eq 0) {
+            continue
+        }
+
+        Write-InstallerMessage "Stopping $($app.Name) desktop app before replacing files..."
+        $processes | Stop-Process -Force -ErrorAction Stop
+        foreach ($process in $processes) {
+            try {
+                Wait-Process -Id $process.Id -Timeout 15 -ErrorAction Stop
+            } catch {
+                Write-InstallerMessage "$($app.Name) process $($process.Id) did not exit within 15 seconds." -Level "WARN"
+            }
+        }
     }
 }
 
@@ -578,7 +616,7 @@ function Resolve-RequestedPackageVersion {
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
-    $required = @("httpma.exe", "imap4a.exe", "smtpra.exe", "smtpda.exe")
+    $required = @("httpma.exe", "imap4a.exe", "smtpra.exe", "smtpda.exe", "expresspro.exe", "console.exe")
     $hasExecutables = $required | Where-Object { Test-Path -LiteralPath (Join-Path $ExtractRoot $_) }
     if ($hasExecutables.Count -eq $required.Count) {
         return $ExtractRoot
@@ -1073,6 +1111,8 @@ function Install-MailSite {
             $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
         }
         $servicesStopped = $true
+
+        Stop-MailSiteDesktopApps -RootDirectory $InstallDir
 
         if ($legacy -and -not [string]::IsNullOrWhiteSpace($legacy.LegacyInstallDir) -and (Test-Path -LiteralPath $legacy.LegacyInstallDir)) {
             Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."

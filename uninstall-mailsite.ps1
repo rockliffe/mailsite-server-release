@@ -12,6 +12,11 @@ $Services = @(
     @{ Name = "SMTPDA"; File = "smtpda.exe" }
 )
 
+$DesktopApps = @(
+    @{ Name = "ExpressPro"; File = "expresspro.exe" },
+    @{ Name = "Console"; File = "console.exe" }
+)
+
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallMarkerName = ".mailsite11-install.json"
 $script:LogPath = $null
@@ -160,6 +165,39 @@ function Stop-MailSiteService {
     return $true
 }
 
+function Stop-MailSiteDesktopApps {
+    param([string]$RootDirectory)
+
+    foreach ($app in $DesktopApps) {
+        $exePath = Join-Path $RootDirectory $app.File
+        $processName = [IO.Path]::GetFileNameWithoutExtension($app.File)
+        $processes = @(
+            Get-Process -Name $processName -ErrorAction SilentlyContinue |
+                Where-Object {
+                    try {
+                        [string]::Equals($_.Path, $exePath, [StringComparison]::OrdinalIgnoreCase)
+                    } catch {
+                        $false
+                    }
+                }
+        )
+
+        if ($processes.Count -eq 0) {
+            continue
+        }
+
+        Write-UninstallerMessage "Stopping $($app.Name) desktop app before removing files..."
+        $processes | Stop-Process -Force -ErrorAction Stop
+        foreach ($process in $processes) {
+            try {
+                Wait-Process -Id $process.Id -Timeout 15 -ErrorAction Stop
+            } catch {
+                Write-UninstallerMessage "$($app.Name) process $($process.Id) did not exit within 15 seconds." -Level "WARN"
+            }
+        }
+    }
+}
+
 function Remove-MailSiteFirewallRules {
     if (-not (Get-Command -Name Remove-NetFirewallRule -ErrorAction SilentlyContinue)) {
         Write-UninstallerMessage "Windows firewall cmdlets are not available; skipping MailSite 11 firewall rule cleanup." -Level "WARN"
@@ -207,6 +245,7 @@ function Confirm-MailSiteUninstall {
     Write-Host ""
     Write-Host "This will:"
     Write-Host "  - Stop MailSite services"
+    Write-Host "  - Stop MailSite desktop apps"
     Write-Host "  - Restore service paths to MailSite 10"
     Write-Host "  - Remove MailSite 11 files"
     Write-Host "  - Remove MailSite 11 firewall rules"
@@ -257,6 +296,8 @@ function Uninstall-MailSite {
     foreach ($service in $Services) {
         Stop-MailSiteService -ServiceName $service.Name | Out-Null
     }
+
+    Stop-MailSiteDesktopApps -RootDirectory $installedDir
 
     foreach ($service in $Services) {
         $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
