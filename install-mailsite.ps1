@@ -17,14 +17,16 @@ $Services = @(
 )
 
 $DesktopApps = @(
-    @{ Name = "ExpressPro"; File = "expresspro.exe" },
-    @{ Name = "Console"; File = "console.exe" }
+    @{ Name = "ExpressPro"; File = "expresspro.exe"; ShortcutName = "ExpressPro" },
+    @{ Name = "Console"; File = "console.exe"; ShortcutName = "MailSite Console" }
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallMarkerName = ".mailsite11-install.json"
 $RequiredLegacyMajorVersion = "10"
 $TargetMajorVersion = "11"
+$WebView2RuntimeClientGuid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+$WebView2BootstrapperUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 $script:LogPath = $null
 
 function Initialize-InstallLog {
@@ -229,6 +231,158 @@ function Stop-MailSiteDesktopApps {
                 Write-InstallerMessage "$($app.Name) process $($process.Id) did not exit within 15 seconds." -Level "WARN"
             }
         }
+    }
+}
+
+function Get-PublicDesktopDirectory {
+    $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
+    if (-not [string]::IsNullOrWhiteSpace($desktop)) {
+        return $desktop
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:PUBLIC)) {
+        return (Join-Path $env:PUBLIC "Desktop")
+    }
+
+    return (Join-Path $env:SystemDrive "Users\Public\Desktop")
+}
+
+function New-MailSiteDesktopShortcuts {
+    param([string]$RootDirectory)
+
+    $desktop = Get-PublicDesktopDirectory
+    New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+    $shell = $null
+
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($app in $DesktopApps) {
+            $exePath = Join-Path $RootDirectory $app.File
+            if (-not (Test-Path -LiteralPath $exePath)) {
+                Write-InstallerMessage "Cannot create $($app.Name) desktop shortcut because $exePath does not exist." -Level "WARN"
+                continue
+            }
+
+            $shortcutName = $app.ShortcutName
+            if ([string]::IsNullOrWhiteSpace($shortcutName)) {
+                $shortcutName = $app.Name
+            }
+
+            $shortcutPath = Join-Path $desktop "$shortcutName.lnk"
+            $shortcut = $null
+            try {
+                $shortcut = $shell.CreateShortcut($shortcutPath)
+                $shortcut.TargetPath = $exePath
+                $shortcut.WorkingDirectory = $RootDirectory
+                $shortcut.IconLocation = "$exePath,0"
+                $shortcut.Description = "Launch $($app.Name)"
+                $shortcut.Save()
+                Write-InstallerMessage "Created all-users desktop shortcut: $shortcutPath"
+            } catch {
+                Write-InstallerMessage "Could not create desktop shortcut '$shortcutPath': $($_.Exception.Message)" -Level "WARN"
+            } finally {
+                if ($null -ne $shortcut) {
+                    [Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut) | Out-Null
+                }
+            }
+        }
+    } catch {
+        Write-InstallerMessage "Could not create all-users desktop shortcuts: $($_.Exception.Message)" -Level "WARN"
+    } finally {
+        if ($null -ne $shell) {
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
+        }
+    }
+}
+
+function Get-WebView2RuntimeRegistryPaths {
+    return @(
+        "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$WebView2RuntimeClientGuid",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$WebView2RuntimeClientGuid",
+        "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$WebView2RuntimeClientGuid",
+        "HKCU:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$WebView2RuntimeClientGuid"
+    )
+}
+
+function Test-WebView2RuntimeInstalled {
+    foreach ($path in (Get-WebView2RuntimeRegistryPaths)) {
+        $version = Get-RegistryString -Path $path -Name "pv"
+        if (-not [string]::IsNullOrWhiteSpace($version) -and $version -ne "0.0.0.0") {
+            return $true
+        }
+
+        $location = Get-RegistryString -Path $path -Name "location"
+        if (-not [string]::IsNullOrWhiteSpace($location)) {
+            $runtimeExe = Join-Path $location "msedgewebview2.exe"
+            if (Test-Path -LiteralPath $runtimeExe) {
+                return $true
+            }
+        }
+    }
+
+    $applicationRoots = @()
+    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+        $applicationRoots += (Join-Path ${env:ProgramFiles(x86)} "Microsoft\EdgeWebView\Application")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $applicationRoots += (Join-Path $env:ProgramFiles "Microsoft\EdgeWebView\Application")
+    }
+
+    foreach ($root in $applicationRoots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            continue
+        }
+
+        $directRuntimeExe = Join-Path $root "msedgewebview2.exe"
+        if (Test-Path -LiteralPath $directRuntimeExe) {
+            return $true
+        }
+
+        $versionDirectories = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)
+        foreach ($directory in $versionDirectories) {
+            $runtimeExe = Join-Path $directory.FullName "msedgewebview2.exe"
+            if (Test-Path -LiteralPath $runtimeExe) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Install-WebView2Runtime {
+    if (Test-WebView2RuntimeInstalled) {
+        Write-InstallerMessage "Microsoft Edge WebView2 Runtime is already installed."
+        return
+    }
+
+    Write-InstallerMessage "Microsoft Edge WebView2 Runtime was not detected. Installing Evergreen Runtime..."
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite-WebView2-" + [Guid]::NewGuid().ToString("N"))
+    $installerPath = Join-Path $tempRoot "MicrosoftEdgeWebView2Setup.exe"
+
+    try {
+        New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $WebView2BootstrapperUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+
+        $process = Start-Process -FilePath $installerPath -ArgumentList "/silent", "/install" -Wait -PassThru
+        if ($process.ExitCode -ne 0 -and -not (Test-WebView2RuntimeInstalled)) {
+            throw "WebView2 bootstrapper exited with code $($process.ExitCode)."
+        }
+
+        if (-not (Test-WebView2RuntimeInstalled)) {
+            throw "WebView2 bootstrapper completed, but the runtime still was not detected."
+        }
+
+        if ($process.ExitCode -ne 0) {
+            Write-InstallerMessage "WebView2 bootstrapper exited with code $($process.ExitCode), but the runtime is now installed." -Level "WARN"
+        } else {
+            Write-InstallerMessage "Microsoft Edge WebView2 Runtime installed successfully."
+        }
+    } catch {
+        throw "Microsoft Edge WebView2 Runtime is required by ExpressPro and Console, but automatic install failed. Install it from https://developer.microsoft.com/en-us/microsoft-edge/webview2/ and retry. $($_.Exception.Message)"
+    } finally {
+        Remove-Item -Path $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -1089,6 +1243,8 @@ function Install-MailSite {
             Write-InstallerMessage "Upgrading MailSite $installedVersion to MailSite $targetVersion in $InstallDir..."
         }
 
+        Install-WebView2Runtime
+
         $existingState = Get-ExistingInstallerState
         $state = @{
             InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
@@ -1121,6 +1277,7 @@ function Install-MailSite {
 
         Remove-InstalledExpressProDist -PackageRoot $packageRoot -DestinationRoot $InstallDir
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
+        New-MailSiteDesktopShortcuts -RootDirectory $InstallDir
 
         Save-InstallerState -State $state
 

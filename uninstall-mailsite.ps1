@@ -13,8 +13,8 @@ $Services = @(
 )
 
 $DesktopApps = @(
-    @{ Name = "ExpressPro"; File = "expresspro.exe" },
-    @{ Name = "Console"; File = "console.exe" }
+    @{ Name = "ExpressPro"; File = "expresspro.exe"; ShortcutName = "ExpressPro" },
+    @{ Name = "Console"; File = "console.exe"; ShortcutName = "MailSite Console" }
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
@@ -198,6 +198,69 @@ function Stop-MailSiteDesktopApps {
     }
 }
 
+function Get-PublicDesktopDirectory {
+    $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
+    if (-not [string]::IsNullOrWhiteSpace($desktop)) {
+        return $desktop
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:PUBLIC)) {
+        return (Join-Path $env:PUBLIC "Desktop")
+    }
+
+    return (Join-Path $env:SystemDrive "Users\Public\Desktop")
+}
+
+function Remove-MailSiteDesktopShortcuts {
+    param([string]$RootDirectory)
+
+    $desktop = Get-PublicDesktopDirectory
+    if (-not (Test-Path -LiteralPath $desktop -PathType Container)) {
+        return
+    }
+
+    $shell = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($app in $DesktopApps) {
+            $shortcutName = $app.ShortcutName
+            if ([string]::IsNullOrWhiteSpace($shortcutName)) {
+                $shortcutName = $app.Name
+            }
+
+            $shortcutPath = Join-Path $desktop "$shortcutName.lnk"
+            if (-not (Test-Path -LiteralPath $shortcutPath)) {
+                continue
+            }
+
+            $expectedTarget = Join-Path $RootDirectory $app.File
+            $shortcut = $null
+            try {
+                $shortcut = $shell.CreateShortcut($shortcutPath)
+                $targetPath = $shortcut.TargetPath
+                if ([string]::Equals($targetPath, $expectedTarget, [StringComparison]::OrdinalIgnoreCase)) {
+                    Remove-Item -LiteralPath $shortcutPath -Force
+                    Write-UninstallerMessage "Removed all-users desktop shortcut: $shortcutPath"
+                } else {
+                    Write-UninstallerMessage "Skipping desktop shortcut '$shortcutPath' because it targets '$targetPath', not '$expectedTarget'." -Level "WARN"
+                }
+            } catch {
+                Write-UninstallerMessage "Could not inspect desktop shortcut '$shortcutPath': $($_.Exception.Message)" -Level "WARN"
+            } finally {
+                if ($null -ne $shortcut) {
+                    [Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut) | Out-Null
+                }
+            }
+        }
+    } catch {
+        Write-UninstallerMessage "Could not remove all-users desktop shortcuts: $($_.Exception.Message)" -Level "WARN"
+    } finally {
+        if ($null -ne $shell) {
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
+        }
+    }
+}
+
 function Remove-MailSiteFirewallRules {
     if (-not (Get-Command -Name Remove-NetFirewallRule -ErrorAction SilentlyContinue)) {
         Write-UninstallerMessage "Windows firewall cmdlets are not available; skipping MailSite 11 firewall rule cleanup." -Level "WARN"
@@ -247,6 +310,7 @@ function Confirm-MailSiteUninstall {
     Write-Host "  - Stop MailSite services"
     Write-Host "  - Stop MailSite desktop apps"
     Write-Host "  - Restore service paths to MailSite 10"
+    Write-Host "  - Remove MailSite desktop shortcuts"
     Write-Host "  - Remove MailSite 11 files"
     Write-Host "  - Remove MailSite 11 firewall rules"
     Write-Host ""
@@ -298,6 +362,7 @@ function Uninstall-MailSite {
     }
 
     Stop-MailSiteDesktopApps -RootDirectory $installedDir
+    Remove-MailSiteDesktopShortcuts -RootDirectory $installedDir
 
     foreach ($service in $Services) {
         $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
