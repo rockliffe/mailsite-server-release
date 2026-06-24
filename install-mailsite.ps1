@@ -356,7 +356,7 @@ function Install-WebView2Runtime {
         return
     }
 
-    Write-InstallerMessage "Microsoft Edge WebView2 Runtime was not detected. Installing Evergreen Runtime..."
+    Write-InstallerMessage "Microsoft Edge WebView2 Runtime was not detected. Installing WebView2 Runtime..."
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite-WebView2-" + [Guid]::NewGuid().ToString("N"))
     $installerPath = Join-Path $tempRoot "MicrosoftEdgeWebView2Setup.exe"
 
