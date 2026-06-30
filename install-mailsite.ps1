@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe"; Description = "MailSite HTTP Management Agent" },
     @{ Name = "IMAP4A"; File = "imap4a.exe"; Description = "MailSite IMAP4 Server" },
-    @{ Name = "POP3A"; File = "pop3a.exe"; Description = "MailSite POP3 Agent" },
+    @{ Name = "POP3A"; File = "pop3a.exe"; Description = "MailSite POP3 Agent"; VersionDetectionRequired = $false },
     @{ Name = "SMTPRA"; File = "smtpra.exe"; Description = "MailSite SMTP Receiving Agent" },
     @{ Name = "SMTPDA"; File = "smtpda.exe"; Description = "MailSite SMTP Delivery Agent" }
 )
@@ -29,6 +29,29 @@ $TargetMajorVersion = "11"
 $WebView2RuntimeClientGuid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 $WebView2BootstrapperUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 $script:LogPath = $null
+
+function Test-InstallerAnsiSupported {
+    try {
+        return ($Host.UI.SupportsVirtualTerminal -eq $true)
+    } catch {
+        return $false
+    }
+}
+
+function Format-InstallerConsoleMessage {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message) -or -not (Test-InstallerAnsiSupported)) {
+        return $Message
+    }
+
+    $versionColor = [string][char]27 + "[96m"
+    $reset = [string][char]27 + "[0m"
+    return [regex]::Replace($Message, '\b(?:10|11)\.[0-9]+\.[0-9]+\b', {
+        param($match)
+        return "$versionColor$($match.Value)$reset"
+    })
+}
 
 function Initialize-InstallLog {
     param([string]$RootDirectory)
@@ -53,9 +76,9 @@ function Write-InstallerMessage {
     }
 
     switch ($Level) {
-        "ERROR" { Write-Host $Message -ForegroundColor Red }
-        "WARN" { Write-Host $Message -ForegroundColor Yellow }
-        default { Write-Host $Message }
+        "ERROR" { Write-Host (Format-InstallerConsoleMessage -Message $Message) -ForegroundColor Red }
+        "WARN" { Write-Host (Format-InstallerConsoleMessage -Message $Message) -ForegroundColor Yellow }
+        default { Write-Host (Format-InstallerConsoleMessage -Message $Message) }
     }
 }
 
@@ -806,32 +829,137 @@ function Get-PackageVersion {
     return $uniqueVersions[0]
 }
 
-function Get-InstalledMailSite11Version {
-    param([string]$RootDirectory)
+function Test-MailSiteVersionDetectionRequired {
+    param([hashtable]$Service)
 
-    if (-not (Test-Path -LiteralPath $RootDirectory -PathType Container)) {
-        return $null
+    if ($Service.ContainsKey("VersionDetectionRequired")) {
+        return [bool]$Service.VersionDetectionRequired
     }
 
-    $versions = @()
+    return $true
+}
+
+function New-EmptyInstalledMailSite11State {
+    return @{
+        IsInstalled = $false
+        IsPartial = $false
+        IsMixed = $false
+        ExactVersion = $null
+        DisplayVersion = $null
+        OldestVersion = $null
+        NewestVersion = $null
+        ComponentVersions = @{}
+        MissingComponents = @()
+        InvalidComponents = @()
+    }
+}
+
+function Get-InstalledMailSite11State {
+    param([string]$RootDirectory)
+
+    $state = New-EmptyInstalledMailSite11State
+    if (-not (Test-Path -LiteralPath $RootDirectory -PathType Container)) {
+        return $state
+    }
+
     foreach ($service in $Services) {
         $exe = Join-Path $RootDirectory $service.File
         if (-not (Test-Path -LiteralPath $exe)) {
-            return $null
+            $state.MissingComponents += $service.Name
+            continue
         }
-        $version = Get-ProductVersion -Path $exe
+
+        try {
+            $version = Get-ProductVersion -Path $exe
+        } catch {
+            $state.InvalidComponents += "$($service.Name) ($($_.Exception.Message))"
+            continue
+        }
+
         if ([string]::IsNullOrWhiteSpace($version) -or -not $version.StartsWith("$TargetMajorVersion.")) {
-            return $null
+            $state.InvalidComponents += "$($service.Name) ($version)"
+            continue
         }
-        $versions += ConvertTo-MailSiteDisplayVersion -Version $version
+
+        $state.ComponentVersions[$service.Name] = ConvertTo-MailSiteDisplayVersion -Version $version
     }
 
-    $uniqueVersions = @($versions | Sort-Object -Unique)
-    if ($uniqueVersions.Count -eq 1) {
-        return $uniqueVersions[0]
+    foreach ($service in $Services) {
+        if ((Test-MailSiteVersionDetectionRequired -Service $service) -and -not $state.ComponentVersions.ContainsKey($service.Name)) {
+            return $state
+        }
     }
 
-    return ($uniqueVersions -join ", ")
+    $state.IsInstalled = $true
+    $state.IsPartial = (($state.MissingComponents.Count -gt 0) -or ($state.InvalidComponents.Count -gt 0))
+
+    $uniqueVersions = @($state.ComponentVersions.Values | Sort-Object -Unique)
+    $orderedVersions = @($uniqueVersions | Sort-Object { [version]$_ })
+    if ($orderedVersions.Count -eq 0) {
+        return $state
+    }
+
+    $state.OldestVersion = $orderedVersions[0]
+    $state.NewestVersion = $orderedVersions[$orderedVersions.Count - 1]
+    if ($orderedVersions.Count -eq 1) {
+        $state.ExactVersion = $orderedVersions[0]
+        $state.DisplayVersion = $orderedVersions[0]
+    } else {
+        $state.IsMixed = $true
+        $state.DisplayVersion = ($orderedVersions -join ", ")
+    }
+
+    return $state
+}
+
+function Get-InstalledMailSite11Version {
+    param([string]$RootDirectory)
+
+    $state = Get-InstalledMailSite11State -RootDirectory $RootDirectory
+    return $state.DisplayVersion
+}
+
+function Get-InstalledMailSiteComparisonVersion {
+    param([hashtable]$InstalledState)
+
+    if ($null -eq $InstalledState -or -not $InstalledState.IsInstalled) {
+        return $null
+    }
+
+    return $InstalledState.NewestVersion
+}
+
+function Get-InstalledMailSiteDisplayVersion {
+    param([hashtable]$InstalledState)
+
+    if ($null -eq $InstalledState -or -not $InstalledState.IsInstalled) {
+        return $null
+    }
+
+    return $InstalledState.DisplayVersion
+}
+
+function Test-MailSiteInstallNeedsRepair {
+    param([hashtable]$InstalledState)
+
+    return ($null -ne $InstalledState -and $InstalledState.IsInstalled -and ($InstalledState.IsPartial -or $InstalledState.IsMixed))
+}
+
+function Get-MailSiteComponentVersionSummary {
+    param([hashtable]$InstalledState)
+
+    if ($null -eq $InstalledState -or -not $InstalledState.IsInstalled) {
+        return ""
+    }
+
+    $parts = @()
+    foreach ($service in $Services) {
+        if ($InstalledState.ComponentVersions.ContainsKey($service.Name)) {
+            $parts += "$($service.Name) $($InstalledState.ComponentVersions[$service.Name])"
+        }
+    }
+
+    return ($parts -join ", ")
 }
 
 function Save-InstallerState {
@@ -877,7 +1005,7 @@ function Read-YesNo {
 
     $suffix = if ($DefaultYes) { "[Y/n]" } else { "[y/N]" }
     while ($true) {
-        $answer = Read-Host "$Prompt $suffix"
+        $answer = Read-Host (Format-InstallerConsoleMessage -Message "$Prompt $suffix")
         if ([string]::IsNullOrWhiteSpace($answer)) {
             return $DefaultYes
         }
@@ -893,6 +1021,7 @@ function Read-YesNo {
 function Read-MailSiteVersionChoice {
     param(
         [string]$InstalledVersion,
+        [hashtable]$InstalledState,
         [string[]]$Versions
     )
 
@@ -900,10 +1029,15 @@ function Read-MailSiteVersionChoice {
         return $null
     }
 
-    if (Test-ExactMailSiteVersion -Version $InstalledVersion) {
-        Write-Host "You are running $InstalledVersion. Other versions available:  $($Versions -join ', ')"
+    $installedDisplayVersion = Get-InstalledMailSiteDisplayVersion -InstalledState $InstalledState
+    if ([string]::IsNullOrWhiteSpace($installedDisplayVersion)) {
+        $installedDisplayVersion = $InstalledVersion
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($installedDisplayVersion)) {
+        Write-Host (Format-InstallerConsoleMessage -Message "You are running $installedDisplayVersion. Other versions available:  $($Versions -join ', ')")
     } else {
-        Write-Host "Other versions available:  $($Versions -join ', ')"
+        Write-Host (Format-InstallerConsoleMessage -Message "Other versions available:  $($Versions -join ', ')")
     }
 
     while ($true) {
@@ -924,7 +1058,8 @@ function Read-MailSiteVersionChoice {
 function Confirm-MailSiteInstall {
     param(
         [string]$Version,
-        [string]$InstalledVersion
+        [string]$InstalledVersion,
+        [hashtable]$InstalledState
     )
 
     Write-Host ""
@@ -933,40 +1068,95 @@ function Confirm-MailSiteInstall {
     Write-Host "This script will install MailSite $Version."
     Write-Host "Install directory: $InstallDir"
     Write-Host ""
-    $prompt = Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $Version
+    $prompt = Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -InstalledState $InstalledState -TargetVersion $Version
     return Read-YesNo -Prompt $prompt -DefaultYes $false
 }
 
 function Get-MailSiteInstallPrompt {
     param(
         [string]$InstalledVersion,
+        [hashtable]$InstalledState,
         [string]$TargetVersion
     )
 
-    if ((Test-ExactMailSiteVersion -Version $InstalledVersion) -and (Test-ExactMailSiteVersion -Version $TargetVersion)) {
-        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $InstalledVersion
+    $installedComparisonVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $InstalledState
+    $installedDisplayVersion = Get-InstalledMailSiteDisplayVersion -InstalledState $InstalledState
+    $needsRepair = Test-MailSiteInstallNeedsRepair -InstalledState $InstalledState
+
+    if ([string]::IsNullOrWhiteSpace($installedComparisonVersion)) {
+        $installedComparisonVersion = $InstalledVersion
+    }
+    if ([string]::IsNullOrWhiteSpace($installedDisplayVersion)) {
+        $installedDisplayVersion = $InstalledVersion
+    }
+
+    if ((Test-ExactMailSiteVersion -Version $installedComparisonVersion) -and (Test-ExactMailSiteVersion -Version $TargetVersion)) {
+        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $installedComparisonVersion
         if ($comparison -eq 0) {
+            if ($needsRepair) {
+                return "Repair MailSite $installedDisplayVersion with MailSite ${TargetVersion}?"
+            }
             return "Reinstall MailSite ${TargetVersion}?"
         }
         if ($comparison -gt 0) {
-            return "Upgrade from MailSite $InstalledVersion to MailSite ${TargetVersion}?"
+            if ($InstalledState.IsMixed) {
+                return "Repair and upgrade MailSite $installedDisplayVersion to MailSite ${TargetVersion}?"
+            }
+            return "Upgrade from MailSite $installedDisplayVersion to MailSite ${TargetVersion}?"
         }
-        return "Downgrade from MailSite $InstalledVersion to MailSite ${TargetVersion}?"
+        return "Downgrade from MailSite $installedDisplayVersion to MailSite ${TargetVersion}?"
     }
 
     return "Install MailSite ${TargetVersion}?"
 }
 
+function Get-MailSiteInstallActionMessage {
+    param(
+        [string]$TargetVersion,
+        [hashtable]$InstalledState,
+        [string]$InstallDirectory
+    )
+
+    $installedDisplayVersion = Get-InstalledMailSiteDisplayVersion -InstalledState $InstalledState
+    if ([string]::IsNullOrWhiteSpace($installedDisplayVersion)) {
+        return "Installing MailSite $TargetVersion to $InstallDirectory..."
+    }
+
+    $installedComparisonVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $InstalledState
+    $needsRepair = Test-MailSiteInstallNeedsRepair -InstalledState $InstalledState
+    if ((Test-ExactMailSiteVersion -Version $TargetVersion) -and (Test-ExactMailSiteVersion -Version $installedComparisonVersion)) {
+        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $installedComparisonVersion
+        if ($comparison -lt 0) {
+            return "Downgrading MailSite $installedDisplayVersion to MailSite $TargetVersion in $InstallDirectory..."
+        }
+        if ($comparison -eq 0 -and $needsRepair) {
+            return "Repairing MailSite $installedDisplayVersion with MailSite $TargetVersion in $InstallDirectory..."
+        }
+    }
+
+    if ($needsRepair -and $InstalledState.IsMixed) {
+        return "Repairing and upgrading MailSite $installedDisplayVersion to MailSite $TargetVersion in $InstallDirectory..."
+    }
+
+    return "Upgrading MailSite $installedDisplayVersion to MailSite $TargetVersion in $InstallDirectory..."
+}
+
 function New-InteractiveRemoteInstallRequest {
     param(
         [string]$TargetVersion,
-        [string]$InstalledVersion
+        [string]$InstalledVersion,
+        [hashtable]$InstalledState
     )
 
     $forceReinstall = $false
     $allowDowngrade = $false
-    if ((Test-ExactMailSiteVersion -Version $TargetVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
-        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $InstalledVersion
+    $installedComparisonVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $InstalledState
+    if ([string]::IsNullOrWhiteSpace($installedComparisonVersion)) {
+        $installedComparisonVersion = $InstalledVersion
+    }
+
+    if ((Test-ExactMailSiteVersion -Version $TargetVersion) -and (Test-ExactMailSiteVersion -Version $installedComparisonVersion)) {
+        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $installedComparisonVersion
         $forceReinstall = ($comparison -eq 0)
         $allowDowngrade = ($comparison -lt 0)
     }
@@ -1022,6 +1212,7 @@ function Get-AlternativeRemotePackageVersions {
 function Resolve-InteractiveRemoteInstallRequest {
     param(
         [string]$InstalledVersion,
+        [hashtable]$InstalledState,
         [hashtable]$LegacyInfo
     )
 
@@ -1034,33 +1225,45 @@ function Resolve-InteractiveRemoteInstallRequest {
 
     Write-InstallerMessage "Latest available MailSite version: $latestVersion."
     $includeLatestInAlternatives = $false
+    $installedComparisonVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $InstalledState
+    if ([string]::IsNullOrWhiteSpace($installedComparisonVersion)) {
+        $installedComparisonVersion = $InstalledVersion
+    }
+    $installedDisplayVersion = Get-InstalledMailSiteDisplayVersion -InstalledState $InstalledState
+    if ([string]::IsNullOrWhiteSpace($installedDisplayVersion)) {
+        $installedDisplayVersion = $InstalledVersion
+    }
 
-    if ((Test-ExactMailSiteVersion -Version $latestVersion) -and (Test-ExactMailSiteVersion -Version $InstalledVersion)) {
-        $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $InstalledVersion
+    if ((Test-ExactMailSiteVersion -Version $latestVersion) -and (Test-ExactMailSiteVersion -Version $installedComparisonVersion)) {
+        $latestComparison = Compare-MailSiteVersions -Left $latestVersion -Right $installedComparisonVersion
         if ($latestComparison -eq 0) {
-            Write-Host "MailSite $latestVersion is already installed."
-            if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
-                return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion
+            if (Test-MailSiteInstallNeedsRepair -InstalledState $InstalledState) {
+                Write-Host (Format-InstallerConsoleMessage -Message "MailSite $latestVersion matches the newest installed component, but the installation needs repair.")
+            } else {
+                Write-Host (Format-InstallerConsoleMessage -Message "MailSite $latestVersion is already installed.")
+            }
+            if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -InstalledState $InstalledState -TargetVersion $latestVersion) -DefaultYes $true) {
+                return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion -InstalledState $InstalledState
             }
         } elseif ($latestComparison -gt 0) {
-            if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
-                return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion
+            if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -InstalledState $InstalledState -TargetVersion $latestVersion) -DefaultYes $true) {
+                return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion -InstalledState $InstalledState
             }
         } else {
-            Write-InstallerMessage "Installed MailSite $InstalledVersion is newer than the latest available package $latestVersion." -Level "WARN"
+            Write-InstallerMessage "Installed MailSite $installedDisplayVersion is newer than the latest available package $latestVersion." -Level "WARN"
             $includeLatestInAlternatives = $true
         }
     } else {
-        if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -TargetVersion $latestVersion) -DefaultYes $true) {
-            return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion
+        if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -InstalledState $InstalledState -TargetVersion $latestVersion) -DefaultYes $true) {
+            return New-InteractiveRemoteInstallRequest -TargetVersion $latestVersion -InstalledVersion $InstalledVersion -InstalledState $InstalledState
         }
     }
 
-    $alternativeVersions = @(Get-AlternativeRemotePackageVersions -Versions $versions -InstalledVersion $InstalledVersion -IncludeLatest $includeLatestInAlternatives)
+    $alternativeVersions = @(Get-AlternativeRemotePackageVersions -Versions $versions -InstalledVersion $installedComparisonVersion -IncludeLatest $includeLatestInAlternatives)
     if ($alternativeVersions.Count -gt 0) {
-        $selectedVersion = Read-MailSiteVersionChoice -InstalledVersion $InstalledVersion -Versions $alternativeVersions
+        $selectedVersion = Read-MailSiteVersionChoice -InstalledVersion $InstalledVersion -InstalledState $InstalledState -Versions $alternativeVersions
         if (-not [string]::IsNullOrWhiteSpace($selectedVersion)) {
-            return New-InteractiveRemoteInstallRequest -TargetVersion $selectedVersion -InstalledVersion $InstalledVersion
+            return New-InteractiveRemoteInstallRequest -TargetVersion $selectedVersion -InstalledVersion $InstalledVersion -InstalledState $InstalledState
         }
     } else {
         Write-InstallerMessage "No other MailSite packages are available in the release repository." -Level "WARN"
@@ -1157,14 +1360,26 @@ function Install-MailSite {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Initialize-InstallLog -RootDirectory $InstallDir
 
-    $installedVersion = Get-InstalledMailSite11Version -RootDirectory $InstallDir
-    if ([string]::IsNullOrWhiteSpace($installedVersion)) {
+    $installedState = Get-InstalledMailSite11State -RootDirectory $InstallDir
+    $installedVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $installedState
+    $installedDisplayVersion = Get-InstalledMailSiteDisplayVersion -InstalledState $installedState
+
+    if (-not $installedState.IsInstalled) {
         # No existing MailSite 11: this is a first-time MailSite 10 -> 11 migration,
         # so a valid MailSite 10 install is required to migrate from.
         $legacy = Assert-MailSite10
         Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
     } else {
-        Write-InstallerMessage "Detected existing MailSite $installedVersion in $InstallDir."
+        Write-InstallerMessage "Detected existing MailSite $installedDisplayVersion in $InstallDir."
+        if ($installedState.IsMixed) {
+            Write-InstallerMessage "Detected mixed MailSite 11 component versions: $(Get-MailSiteComponentVersionSummary -InstalledState $installedState)." -Level "WARN"
+        }
+        if ($installedState.MissingComponents.Count -gt 0) {
+            Write-InstallerMessage "Existing MailSite 11 install does not yet have component(s): $($installedState.MissingComponents -join ', '). The installer will add them with this package."
+        }
+        if ($installedState.InvalidComponents.Count -gt 0) {
+            Write-InstallerMessage "Existing MailSite 11 install has component(s) with invalid versions: $($installedState.InvalidComponents -join ', ')." -Level "WARN"
+        }
         # Upgrading an existing MailSite 11 install. MailSite 10 may have been
         # removed; use it for permission copying if it's still present, but don't
         # block the upgrade on it.
@@ -1180,7 +1395,7 @@ function Install-MailSite {
     $installRequest = Resolve-InstallRequest
 
     if ($installRequest.Interactive -and [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
-        $installRequest = Resolve-InteractiveRemoteInstallRequest -InstalledVersion $installedVersion -LegacyInfo $legacy
+        $installRequest = Resolve-InteractiveRemoteInstallRequest -InstalledVersion $installedVersion -InstalledState $installedState -LegacyInfo $legacy
         if ($installRequest.Cancelled) {
             return
         }
@@ -1191,20 +1406,20 @@ function Install-MailSite {
 
     if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and (Test-ExactMailSiteVersion -Version $installedVersion)) {
         $requestedComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
-        if ($requestedComparison -eq 0 -and -not $installRequest.ForceReinstall) {
+        if ($requestedComparison -eq 0 -and -not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
             Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
             return
         }
         if ($requestedComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
-            Write-InstallerMessage "MailSite $installedVersion is already installed, which is newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
+            Write-InstallerMessage "MailSite $installedDisplayVersion is already installed, which includes a component newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
             return
         }
         if ($requestedComparison -lt 0) {
-            Write-InstallerMessage "Downgrading MailSite only replaces binaries; SQLite database schemas are not rolled back. Verify MailSite $requestedVersion can read any schema changes already applied by MailSite $installedVersion." -Level "WARN"
+            Write-InstallerMessage "Downgrading MailSite only replaces binaries; SQLite database schemas are not rolled back. Verify MailSite $requestedVersion can read any schema changes already applied by MailSite $installedDisplayVersion." -Level "WARN"
         }
     }
 
-    if (-not $installRequest.SkipConfirm -and -not (Confirm-MailSiteInstall -Version $requestedVersion -InstalledVersion $installedVersion)) {
+    if (-not $installRequest.SkipConfirm -and -not (Confirm-MailSiteInstall -Version $requestedVersion -InstalledVersion $installedVersion -InstalledState $installedState)) {
         Write-InstallerMessage "Installation cancelled by user."
         return
     }
@@ -1225,24 +1440,20 @@ function Install-MailSite {
 
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
             $targetComparison = Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion
-            if ($targetComparison -eq 0 -and -not $installRequest.ForceReinstall) {
+            if ($targetComparison -eq 0 -and -not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
                 Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
                 Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
                 return
             }
             if ($targetComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
-                throw "Cannot install MailSite $targetVersion because MailSite $installedVersion is already installed. Download a newer MailSite package and retry."
+                throw "Cannot install MailSite $targetVersion because installed MailSite components include $installedVersion. Download a newer MailSite package and retry."
             }
             if ($targetComparison -lt 0) {
-                Write-InstallerMessage "Continuing with downgrade from MailSite $installedVersion to MailSite $targetVersion." -Level "WARN"
+                Write-InstallerMessage "Continuing with downgrade from MailSite $installedDisplayVersion to MailSite $targetVersion." -Level "WARN"
             }
         }
 
-        if ([string]::IsNullOrWhiteSpace($installedVersion)) {
-            Write-InstallerMessage "Installing MailSite $targetVersion to $InstallDir..."
-        } else {
-            Write-InstallerMessage "Upgrading MailSite $installedVersion to MailSite $targetVersion in $InstallDir..."
-        }
+        Write-InstallerMessage (Get-MailSiteInstallActionMessage -TargetVersion $targetVersion -InstalledState $installedState -InstallDirectory $InstallDir)
 
         Install-WebView2Runtime
 
