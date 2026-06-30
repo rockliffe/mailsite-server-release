@@ -12,6 +12,7 @@ $ErrorActionPreference = "Stop"
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe"; Description = "MailSite HTTP Management Agent" },
     @{ Name = "IMAP4A"; File = "imap4a.exe"; Description = "MailSite IMAP4 Server" },
+    @{ Name = "POP3A"; File = "pop3a.exe"; Description = "MailSite POP3 Agent" },
     @{ Name = "SMTPRA"; File = "smtpra.exe"; Description = "MailSite SMTP Receiving Agent" },
     @{ Name = "SMTPDA"; File = "smtpda.exe"; Description = "MailSite SMTP Delivery Agent" }
 )
@@ -770,7 +771,7 @@ function Resolve-RequestedPackageVersion {
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
-    $required = @("httpma.exe", "imap4a.exe", "smtpra.exe", "smtpda.exe", "expresspro.exe", "console.exe")
+    $required = @("httpma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtpda.exe", "expresspro.exe", "console.exe")
     $hasExecutables = $required | Where-Object { Test-Path -LiteralPath (Join-Path $ExtractRoot $_) }
     if ($hasExecutables.Count -eq $required.Count) {
         return $ExtractRoot
