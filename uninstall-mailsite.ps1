@@ -166,6 +166,22 @@ function Stop-MailSiteService {
     return $true
 }
 
+function Remove-MailSiteWindowsService {
+    param([string]$ServiceName)
+
+    if ($null -eq (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+        Write-UninstallerMessage "$ServiceName service is not installed."
+        return
+    }
+
+    & sc.exe delete $ServiceName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not delete the $ServiceName service. sc.exe exited with code $LASTEXITCODE."
+    }
+
+    Write-UninstallerMessage "Removed $ServiceName service."
+}
+
 function Stop-MailSiteDesktopApps {
     param([string]$RootDirectory)
 
@@ -293,7 +309,8 @@ function Load-InstallerState {
 function Confirm-MailSiteUninstall {
     param(
         [object]$State,
-        [string]$InstalledDirectory
+        [string]$InstalledDirectory,
+        [bool]$FreshInstall
     )
 
     $targetVersion = $State.TargetVersion
@@ -310,7 +327,12 @@ function Confirm-MailSiteUninstall {
     Write-Host "This will:"
     Write-Host "  - Stop MailSite services"
     Write-Host "  - Stop MailSite desktop apps"
-    Write-Host "  - Restore service paths to MailSite 10"
+    if ($FreshInstall) {
+        # This MailSite 11 was a fresh install; there is no MailSite 10 to revert to.
+        Write-Host "  - Remove MailSite services"
+    } else {
+        Write-Host "  - Restore service paths to MailSite 10"
+    }
     Write-Host "  - Remove MailSite desktop shortcuts"
     Write-Host "  - Remove MailSite 11 files"
     Write-Host "  - Remove MailSite 11 firewall rules"
@@ -329,46 +351,69 @@ function Uninstall-MailSite {
         $installedDir = $InstallDir
     }
 
+    # MailSite 11 installs written by the fresh-install flow record FreshInstall in
+    # the marker: there is no MailSite 10 to revert to, so the services created by
+    # the fresh install are deleted outright instead of being re-pointed.
+    $freshInstall = $false
+    $freshInstallProperty = $state.PSObject.Properties["FreshInstall"]
+    if ($null -ne $freshInstallProperty) {
+        $freshInstall = [bool]$freshInstallProperty.Value
+    }
+
     # Resolve where each service reverts to (its MailSite 10 binary) before making
     # any changes. If MailSite 10 has been removed there is nothing to revert to,
     # so notify the user and stop rather than leaving the services half-reverted.
     $restorePaths = @{}
-    $unrevertable = @()
-    foreach ($service in $Services) {
-        $previous = $state.PreviousImagePath.($service.Name)
-        $restorePath = Resolve-UninstallServiceImagePath -Service $service -SavedImagePath $previous
-        if ([string]::IsNullOrWhiteSpace($restorePath)) {
-            $unrevertable += $service.Name
-        } else {
-            $restorePaths[$service.Name] = $restorePath
+    if (-not $freshInstall) {
+        $unrevertable = @()
+        foreach ($service in $Services) {
+            $previous = $state.PreviousImagePath.($service.Name)
+            $restorePath = Resolve-UninstallServiceImagePath -Service $service -SavedImagePath $previous
+            if ([string]::IsNullOrWhiteSpace($restorePath)) {
+                $unrevertable += $service.Name
+            } else {
+                $restorePaths[$service.Name] = $restorePath
+            }
         }
-    }
-    if ($unrevertable.Count -gt 0) {
-        $legacyDir = Get-RegistryString -Path $MailSiteKey32 -Name "InstallDir"
-        Write-UninstallerMessage "MailSite 10 is no longer present, so the uninstaller cannot revert these services to it: $($unrevertable -join ', ')." -Level "WARN"
-        if (-not [string]::IsNullOrWhiteSpace($legacyDir)) {
-            Write-UninstallerMessage "Restore the MailSite 10 installation (expected at '$legacyDir') and run uninstall again." -Level "WARN"
+        if ($unrevertable.Count -gt 0) {
+            $legacyDir = Get-RegistryString -Path $MailSiteKey32 -Name "InstallDir"
+            Write-UninstallerMessage "MailSite 10 is no longer present, so the uninstaller cannot revert these services to it: $($unrevertable -join ', ')." -Level "WARN"
+            if (-not [string]::IsNullOrWhiteSpace($legacyDir)) {
+                Write-UninstallerMessage "Restore the MailSite 10 installation (expected at '$legacyDir') and run uninstall again." -Level "WARN"
+            }
+            Write-UninstallerMessage "No changes were made." -Level "WARN"
+            return
         }
-        Write-UninstallerMessage "No changes were made." -Level "WARN"
-        return
     }
 
-    if (-not (Confirm-MailSiteUninstall -State $state -InstalledDirectory $installedDir)) {
+    if (-not (Confirm-MailSiteUninstall -State $state -InstalledDirectory $installedDir -FreshInstall $freshInstall)) {
         Write-UninstallerMessage "Uninstall cancelled by user."
         return
     }
 
     foreach ($service in $Services) {
+        # A failed or partially completed fresh install may not have created every
+        # service, so tolerate missing services in fresh mode.
+        if ($freshInstall -and $null -eq (Get-Service -Name $service.Name -ErrorAction SilentlyContinue)) {
+            Write-UninstallerMessage "$($service.Name) service is not installed."
+            continue
+        }
         Stop-MailSiteService -ServiceName $service.Name | Out-Null
     }
 
     Stop-MailSiteDesktopApps -RootDirectory $installedDir
     Remove-MailSiteDesktopShortcuts -RootDirectory $installedDir
 
-    foreach ($service in $Services) {
-        $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
-        Set-ItemProperty -Path $path -Name ImagePath -Value $restorePaths[$service.Name]
-        Write-UninstallerMessage "Restored $($service.Name) service path to $($restorePaths[$service.Name])."
+    if ($freshInstall) {
+        foreach ($service in $Services) {
+            Remove-MailSiteWindowsService -ServiceName $service.Name
+        }
+    } else {
+        foreach ($service in $Services) {
+            $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
+            Set-ItemProperty -Path $path -Name ImagePath -Value $restorePaths[$service.Name]
+            Write-UninstallerMessage "Restored $($service.Name) service path to $($restorePaths[$service.Name])."
+        }
     }
 
     Remove-MailSiteFirewallRules
@@ -379,7 +424,11 @@ function Uninstall-MailSite {
         Remove-Item -Path $installedDir -Recurse -Force
     }
 
-    Write-Host "MailSite 11 uninstall completed successfully. Services were left stopped; start them manually after verification."
+    if ($freshInstall) {
+        Write-Host "MailSite 11 uninstall completed successfully. MailSite services were removed."
+    } else {
+        Write-Host "MailSite 11 uninstall completed successfully. Services were left stopped; start them manually after verification."
+    }
 }
 
 try {

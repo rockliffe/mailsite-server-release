@@ -1355,6 +1355,499 @@ function Remove-InstalledExpressProDist {
     Remove-Item -LiteralPath $installedDist -Recurse -Force
 }
 
+function Invoke-MailSiteExecutable {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList
+    )
+
+    if (-not (Test-Path -LiteralPath $FilePath) -and $null -eq (Get-Command -Name $FilePath -ErrorAction SilentlyContinue)) {
+        throw "Missing required executable: $FilePath"
+    }
+
+    # Merge stderr into the captured output without letting native stderr lines
+    # become terminating errors under $ErrorActionPreference = "Stop".
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $FilePath @ArgumentList 2>&1 | ForEach-Object { $_.ToString() }
+        return @{
+            ExitCode = $LASTEXITCODE
+            Output = @($output)
+        }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Read-MaskedInput {
+    param([string]$Prompt)
+
+    $secure = Read-Host -Prompt (Format-InstallerConsoleMessage -Message $Prompt) -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+function New-PostmasterPassword {
+    # 16 characters from an unambiguous alphanumeric alphabet (no 0/O/o, 1/I/l/i).
+    $alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    $length = 16
+    $rejectionLimit = 256 - (256 % $alphabet.Length)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $builder = New-Object System.Text.StringBuilder $length
+        $buffer = New-Object byte[] 1
+        while ($builder.Length -lt $length) {
+            $rng.GetBytes($buffer)
+            if ($buffer[0] -ge $rejectionLimit) {
+                continue
+            }
+            [void]$builder.Append($alphabet[$buffer[0] % $alphabet.Length])
+        }
+        return $builder.ToString()
+    } finally {
+        $rng.Dispose()
+    }
+}
+
+function Get-DefaultMailDomainName {
+    # Legacy parity: the MailSite 10 installer defaulted the mail domain to the
+    # TCP/IP host name plus the DNS domain suffix (when present), lowercased.
+    $tcpipParameters = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    $hostName = Get-RegistryString -Path $tcpipParameters -Name "HostName"
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        $hostName = $env:COMPUTERNAME
+    }
+
+    $dnsDomain = Get-RegistryString -Path $tcpipParameters -Name "Domain"
+    $default = if ([string]::IsNullOrWhiteSpace($dnsDomain)) { $hostName } else { "$hostName.$dnsDomain" }
+    return $default.ToLowerInvariant()
+}
+
+function Read-FreshInstallDomainName {
+    $default = Get-DefaultMailDomainName
+    while ($true) {
+        $answer = Read-Host "Mail domain name [$default]"
+        $candidate = if ([string]::IsNullOrWhiteSpace($answer)) { $default } else { $answer.Trim() }
+        if ($candidate -match '^[A-Za-z0-9][A-Za-z0-9.-]*$') {
+            return $candidate.ToLowerInvariant()
+        }
+
+        Write-Host "Please enter a valid domain name (letters, digits, dots, and hyphens)." -ForegroundColor Yellow
+    }
+}
+
+function Read-FreshInstallLicenseKeyText {
+    $answer = Read-Host "MailSite license key (blank or DEMO for a 30-day demo trial)"
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        return "DEMO"
+    }
+
+    return $answer.Trim()
+}
+
+function Resolve-FreshInstallLicenseKey {
+    param(
+        [string]$HttpmaPath,
+        [string]$InitialKey
+    )
+
+    $key = $InitialKey
+    while ($true) {
+        Write-InstallerMessage "Validating MailSite license key..."
+        $result = Invoke-MailSiteExecutable -FilePath $HttpmaPath -ArgumentList @("license-info", $key)
+        if ($result.ExitCode -eq 0) {
+            if ($key -ieq "DEMO") {
+                Write-InstallerMessage "Installing with a 30-day MailSite demo trial license."
+            }
+            foreach ($line in @($result.Output)) {
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    Write-InstallerMessage "  $line"
+                }
+            }
+            return $key
+        }
+
+        $detail = (@($result.Output) -join "; ").Trim()
+        if ($key -ieq "DEMO") {
+            throw "httpma.exe rejected the built-in DEMO trial license (exit code $($result.ExitCode)). $detail"
+        }
+
+        Write-InstallerMessage "The license key was not accepted: $detail" -Level "WARN"
+        $key = Read-FreshInstallLicenseKeyText
+    }
+}
+
+function Read-FreshInstallPostmasterPassword {
+    while ($true) {
+        $password = Read-MaskedInput -Prompt "Postmaster password (blank to autogenerate)"
+        if ([string]::IsNullOrEmpty($password)) {
+            Write-InstallerMessage "A random Postmaster password will be generated and shown at the end of the install."
+            return @{ Password = New-PostmasterPassword; Generated = $true }
+        }
+
+        $confirmation = Read-MaskedInput -Prompt "Confirm Postmaster password"
+        if ($password -ceq $confirmation) {
+            return @{ Password = $password; Generated = $false }
+        }
+
+        Write-Host "The passwords do not match. Please try again." -ForegroundColor Yellow
+    }
+}
+
+function Test-ServiceAccountCredential {
+    param(
+        [string]$UserName,
+        [string]$Password
+    )
+
+    Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+
+    $parts = $UserName.Split('\')
+    $domainPart = $parts[0]
+    $userPart = $parts[1]
+    $isMachineAccount = ($domainPart -eq "." -or $domainPart -ieq $env:COMPUTERNAME)
+
+    $context = $null
+    try {
+        if ($isMachineAccount) {
+            $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext([System.DirectoryServices.AccountManagement.ContextType]::Machine)
+        } else {
+            $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext([System.DirectoryServices.AccountManagement.ContextType]::Domain, $domainPart)
+        }
+        return $context.ValidateCredentials($userPart, $Password)
+    } catch {
+        Write-InstallerMessage "Could not validate credentials for '$UserName': $($_.Exception.Message)" -Level "WARN"
+        return $false
+    } finally {
+        if ($null -ne $context) {
+            $context.Dispose()
+        }
+    }
+}
+
+function Read-FreshInstallServiceAccount {
+    Write-Host "MailSite services run as the LocalSystem account by default."
+    while ($true) {
+        $answer = Read-Host "Service account (blank for LocalSystem, or DOMAIN\user)"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return $null
+        }
+
+        $candidate = $answer.Trim()
+        if ($candidate -ieq "LocalSystem") {
+            return $null
+        }
+
+        if ($candidate -notmatch '^[^\\]+\\[^\\]+$') {
+            Write-Host "Enter the account as DOMAIN\user (or .\user for a local account), or leave blank for LocalSystem." -ForegroundColor Yellow
+            continue
+        }
+
+        $parts = $candidate.Split('\')
+        if ($parts[0] -eq ".") {
+            $candidate = "$env:COMPUTERNAME\$($parts[1])"
+        }
+
+        $password = Read-MaskedInput -Prompt "Password for $candidate"
+        Write-InstallerMessage "Validating credentials for $candidate..."
+        if (Test-ServiceAccountCredential -UserName $candidate -Password $password) {
+            Write-InstallerMessage "Credentials for $candidate were validated."
+            return @{ UserName = $candidate; Password = $password }
+        }
+
+        Write-Host "Could not validate the credentials for '$candidate'. Please try again." -ForegroundColor Yellow
+    }
+}
+
+function Add-LsaRightsType {
+    if ("MailSiteLsaRights" -as [type]) {
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class MailSiteLsaRights
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LSA_UNICODE_STRING
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LSA_OBJECT_ATTRIBUTES
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [DllImport("advapi32.dll", PreserveSig = true)]
+    private static extern uint LsaOpenPolicy(IntPtr SystemName, ref LSA_OBJECT_ATTRIBUTES ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
+
+    [DllImport("advapi32.dll", PreserveSig = true)]
+    private static extern uint LsaAddAccountRights(IntPtr PolicyHandle, IntPtr AccountSid, LSA_UNICODE_STRING[] UserRights, uint CountOfRights);
+
+    [DllImport("advapi32.dll")]
+    private static extern uint LsaClose(IntPtr PolicyHandle);
+
+    [DllImport("advapi32.dll")]
+    private static extern uint LsaNtStatusToWinError(uint Status);
+
+    private const uint POLICY_CREATE_ACCOUNT = 0x00000010;
+    private const uint POLICY_LOOKUP_NAMES = 0x00000800;
+
+    public static void AddAccountRight(byte[] accountSid, string rightName)
+    {
+        LSA_OBJECT_ATTRIBUTES attributes = new LSA_OBJECT_ATTRIBUTES();
+        IntPtr policyHandle;
+        uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, out policyHandle);
+        if (status != 0)
+        {
+            throw new Win32Exception((int)LsaNtStatusToWinError(status));
+        }
+
+        IntPtr sidPointer = Marshal.AllocHGlobal(accountSid.Length);
+        IntPtr rightPointer = Marshal.StringToHGlobalUni(rightName);
+        try
+        {
+            Marshal.Copy(accountSid, 0, sidPointer, accountSid.Length);
+            LSA_UNICODE_STRING[] rights = new LSA_UNICODE_STRING[1];
+            rights[0].Buffer = rightPointer;
+            rights[0].Length = (ushort)(rightName.Length * 2);
+            rights[0].MaximumLength = (ushort)((rightName.Length + 1) * 2);
+            status = LsaAddAccountRights(policyHandle, sidPointer, rights, 1);
+            if (status != 0)
+            {
+                throw new Win32Exception((int)LsaNtStatusToWinError(status));
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(rightPointer);
+            Marshal.FreeHGlobal(sidPointer);
+            LsaClose(policyHandle);
+        }
+    }
+}
+"@
+}
+
+function Grant-ServiceLogonRight {
+    param([string]$AccountName)
+
+    Add-LsaRightsType
+    $account = New-Object System.Security.Principal.NTAccount($AccountName)
+    $sid = $account.Translate([System.Security.Principal.SecurityIdentifier])
+    $sidBytes = New-Object byte[] ($sid.BinaryLength)
+    $sid.GetBinaryForm($sidBytes, 0)
+    [MailSiteLsaRights]::AddAccountRight($sidBytes, "SeServiceLogonRight")
+    Write-InstallerMessage "Granted 'Log on as a service' (SeServiceLogonRight) to $AccountName."
+}
+
+function Invoke-MailSiteFreshSetup {
+    param(
+        [string]$HttpmaPath,
+        [string]$LicenseKey,
+        [string]$DomainName,
+        [string]$PostmasterPassword,
+        [string]$Version,
+        [string]$InstallDirectory
+    )
+
+    Write-InstallerMessage "Creating MailSite registry defaults, default domain '$DomainName', and the Postmaster mailbox..."
+    $arguments = @(
+        "setup",
+        "--license", $LicenseKey,
+        "--domain", $DomainName,
+        "--postmaster-password", $PostmasterPassword,
+        "--version", $Version,
+        "--install-dir", $InstallDirectory
+    )
+    $result = Invoke-MailSiteExecutable -FilePath $HttpmaPath -ArgumentList $arguments
+    if ($result.ExitCode -ne 0) {
+        $detail = (@($result.Output) -join [Environment]::NewLine).Trim()
+        throw "MailSite setup failed (httpma.exe setup exited with code $($result.ExitCode)). $detail"
+    }
+
+    Write-InstallerMessage "MailSite configuration defaults were created."
+}
+
+function Install-MailSiteWindowsService {
+    param(
+        [hashtable]$Service,
+        [string]$ExecutablePath,
+        [hashtable]$ServiceAccount
+    )
+
+    $arguments = @("install")
+    if ($null -ne $ServiceAccount) {
+        $arguments += @("--username", $ServiceAccount.UserName, "--password", $ServiceAccount.Password)
+    }
+
+    Write-InstallerMessage "Installing the $($Service.Name) Windows service..."
+    $result = Invoke-MailSiteExecutable -FilePath $ExecutablePath -ArgumentList $arguments
+    if ($result.ExitCode -ne 0) {
+        $detail = (@($result.Output) -join [Environment]::NewLine).Trim()
+        throw "Could not install the $($Service.Name) Windows service ($ExecutablePath install exited with code $($result.ExitCode)). $detail"
+    }
+}
+
+function Set-FreshInstallDirectoryAcl {
+    param(
+        [string]$Directory,
+        [hashtable]$ServiceAccount
+    )
+
+    # Mirror the legacy installer's PermissionInstallDir step: grant SYSTEM (and the
+    # custom service account, when one is used) full control over the install tree.
+    # S-1-5-18 is the well-known SYSTEM SID, so this works on localized systems.
+    $arguments = @($Directory, "/grant", "*S-1-5-18:(OI)(CI)F")
+    $grantSummary = "SYSTEM"
+    if ($null -ne $ServiceAccount) {
+        $arguments += @("/grant", "$($ServiceAccount.UserName):(OI)(CI)F")
+        $grantSummary += " and $($ServiceAccount.UserName)"
+    }
+    $arguments += @("/T", "/C", "/Q")
+
+    Write-InstallerMessage "Granting full control on $Directory to $grantSummary..."
+    $result = Invoke-MailSiteExecutable -FilePath "icacls.exe" -ArgumentList $arguments
+    if ($result.ExitCode -ne 0) {
+        $detail = (@($result.Output) -join [Environment]::NewLine).Trim()
+        Write-InstallerMessage "Could not update permissions on ${Directory}: icacls.exe exited with code $($result.ExitCode). $detail" -Level "WARN"
+    }
+}
+
+function Install-MailSiteFresh {
+    Write-InstallerMessage "No existing MailSite installation was detected. Preparing a fresh MailSite $TargetMajorVersion install."
+
+    $installRequest = Resolve-InstallRequest
+    $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
+
+    Write-Host ""
+    Write-Host "MailSite 11 Fresh Install"
+    Write-Host "========================="
+    Write-Host "No existing MailSite installation was detected on this machine."
+    Write-Host (Format-InstallerConsoleMessage -Message "This script will perform a fresh install of MailSite $requestedVersion.")
+    Write-Host "Install directory: $InstallDir"
+    Write-Host ""
+    if (-not (Read-YesNo -Prompt "Install MailSite ${requestedVersion}?" -DefaultYes $true)) {
+        Write-InstallerMessage "Installation cancelled by user."
+        return
+    }
+
+    # Gather all interactive input before the long-running download/extract steps.
+    # The license key text is collected here and validated after extraction, once
+    # the packaged httpma.exe is available to decode it.
+    Write-Host ""
+    Write-Host "MailSite setup needs a few details before installing."
+    $licenseKey = Read-FreshInstallLicenseKeyText
+    $domainName = Read-FreshInstallDomainName
+    $postmaster = Read-FreshInstallPostmasterPassword
+    $serviceAccount = Read-FreshInstallServiceAccount
+
+    $package = Resolve-PackagePath -DestinationDirectory $InstallDir -RemoteVersion $installRequest.RemoteVersion
+    $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+
+    try {
+        Write-InstallerMessage "Extracting $package..."
+        Expand-Archive -Path $package -DestinationPath $extractRoot -Force
+        $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
+        $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
+
+        $licenseKey = Resolve-FreshInstallLicenseKey -HttpmaPath (Join-Path $packageRoot "httpma.exe") -InitialKey $licenseKey
+
+        Install-WebView2Runtime
+
+        Write-InstallerMessage "Installing MailSite $targetVersion to $InstallDir..."
+        Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
+        New-MailSiteDesktopShortcuts -RootDirectory $InstallDir
+
+        # Save the marker before configuring services so a failed install can still
+        # be cleaned up with uninstall-mailsite.ps1. FreshInstall tells the
+        # uninstaller to delete the services instead of reverting to MailSite 10.
+        Save-InstallerState -State @{
+            InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
+            InstallDir11 = $InstallDir
+            TargetVersion = $targetVersion
+            FreshInstall = $true
+            PreviousImagePath = @{}
+            PreviousDescription = @{}
+            WasRunning = @{}
+        }
+
+        Invoke-MailSiteFreshSetup `
+            -HttpmaPath (Join-Path $InstallDir "httpma.exe") `
+            -LicenseKey $licenseKey `
+            -DomainName $domainName `
+            -PostmasterPassword $postmaster.Password `
+            -Version $targetVersion `
+            -InstallDirectory $InstallDir
+
+        if ($null -ne $serviceAccount) {
+            Grant-ServiceLogonRight -AccountName $serviceAccount.UserName
+        }
+
+        foreach ($service in $Services) {
+            $newExe = Join-Path $InstallDir $service.File
+            if (-not (Test-Path -LiteralPath $newExe)) {
+                throw "Package did not install $newExe."
+            }
+            Install-MailSiteWindowsService -Service $service -ExecutablePath $newExe -ServiceAccount $serviceAccount
+            Set-ServiceDescription -ServiceName $service.Name -Description $service.Description
+            Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
+        }
+
+        Set-FreshInstallDirectoryAcl -Directory $InstallDir -ServiceAccount $serviceAccount
+
+        Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
+
+        $startFailures = @()
+        foreach ($service in $Services) {
+            if (-not (Start-MailSiteService -ServiceName $service.Name)) {
+                $startFailures += $service.Name
+            }
+        }
+
+        $serviceAccountDisplay = if ($null -eq $serviceAccount) { "LocalSystem" } else { $serviceAccount.UserName }
+        Write-Host ""
+        Write-InstallerMessage "MailSite $targetVersion fresh install completed."
+        Write-InstallerMessage "  Install directory:  $InstallDir"
+        Write-InstallerMessage "  Default domain:     $domainName"
+        Write-InstallerMessage "  Postmaster mailbox: Postmaster@$domainName"
+        Write-InstallerMessage "  Service account:    $serviceAccountDisplay"
+        if ($licenseKey -ieq "DEMO") {
+            Write-InstallerMessage "  License:            30-day demo trial. Enter a purchased license key in the MailSite Console before the trial expires."
+        }
+        if ($postmaster.Generated) {
+            Write-Host ""
+            Write-Host "  A password was generated for Postmaster@${domainName}:" -ForegroundColor Yellow
+            Write-Host "      $($postmaster.Password)" -ForegroundColor Cyan
+            Write-Host "  Record this password now. It is not saved anywhere else and will not be shown again." -ForegroundColor Yellow
+            Write-InstallerMessage "An autogenerated Postmaster password was displayed to the operator (not written to this log)."
+        }
+        if ($startFailures.Count -gt 0) {
+            Write-InstallerMessage "These services could not be started and may need attention: $($startFailures -join ', ')." -Level "WARN"
+        }
+    } finally {
+        Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-MailSite {
     Assert-Administrator
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -1365,6 +1858,15 @@ function Install-MailSite {
     $installedDisplayVersion = Get-InstalledMailSiteDisplayVersion -InstalledState $installedState
 
     if (-not $installedState.IsInstalled) {
+        if (-not (Test-Path $MailSiteKey32)) {
+            # No MailSite 11 in $InstallDir and no MailSite registry key at all:
+            # this is a genuinely fresh machine, so run the fresh install flow.
+            # A present-but-broken MailSite 10 registry key still goes through
+            # Assert-MailSite10 below and surfaces its existing errors.
+            Install-MailSiteFresh
+            return
+        }
+
         # No existing MailSite 11: this is a first-time MailSite 10 -> 11 migration,
         # so a valid MailSite 10 install is required to migrate from.
         $legacy = Assert-MailSite10
@@ -1462,6 +1964,10 @@ function Install-MailSite {
             InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             InstallDir11 = $InstallDir
             TargetVersion = $targetVersion
+            # Preserve the fresh-install marker across upgrades so uninstall keeps
+            # deleting the services instead of reverting to a MailSite 10 that
+            # never existed on this machine.
+            FreshInstall = ($null -ne $existingState -and [bool]$existingState.FreshInstall)
             PreviousImagePath = Copy-StateMap -State $existingState -PropertyName "PreviousImagePath"
             PreviousDescription = Copy-StateMap -State $existingState -PropertyName "PreviousDescription"
             WasRunning = @{}
