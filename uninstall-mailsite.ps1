@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe" },
+    @{ Name = "EWSMA"; File = "ewsma.exe" },
+    @{ Name = "EASMA"; File = "easma.exe" },
     @{ Name = "IMAP4A"; File = "imap4a.exe" },
     @{ Name = "POP3A"; File = "pop3a.exe" },
     @{ Name = "SMTPRA"; File = "smtpra.exe" },
