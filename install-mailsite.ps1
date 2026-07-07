@@ -11,8 +11,8 @@ $ErrorActionPreference = "Stop"
 
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe"; Description = "MailSite HTTP Management Agent" },
-    @{ Name = "EWSMA"; File = "ewsma.exe"; Description = "MailSite EWS Management Agent" },
-    @{ Name = "EASMA"; File = "easma.exe"; Description = "MailSite Exchange ActiveSync Management Agent" },
+    @{ Name = "EWSMA"; File = "ewsma.exe"; Description = "MailSite EWS Management Agent"; LegacyService = $false },
+    @{ Name = "EASMA"; File = "easma.exe"; Description = "MailSite Exchange ActiveSync Management Agent"; LegacyService = $false },
     @{ Name = "IMAP4A"; File = "imap4a.exe"; Description = "MailSite IMAP4 Server" },
     @{ Name = "POP3A"; File = "pop3a.exe"; Description = "MailSite POP3 Agent"; VersionDetectionRequired = $false },
     @{ Name = "SMTPRA"; File = "smtpra.exe"; Description = "MailSite SMTP Receiving Agent" },
@@ -154,6 +154,12 @@ function Get-ServiceImagePath {
     }
 
     return (Get-ItemProperty -Path $path -Name ImagePath).ImagePath
+}
+
+function Test-MailSiteServiceInstalled {
+    param([string]$ServiceName)
+
+    return ($null -ne (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue))
 }
 
 function Set-ServiceImagePath {
@@ -556,6 +562,16 @@ function Get-RemotePackageUrl {
     return "$($repoInfo.RawBaseUrl)/MailSite.$Version.zip"
 }
 
+function Test-MailSiteLegacyService {
+    param([hashtable]$Service)
+
+    if ($Service.ContainsKey("LegacyService")) {
+        return [bool]$Service.LegacyService
+    }
+
+    return $true
+}
+
 function Assert-MailSite10 {
     if (-not (Test-Path $MailSiteKey32)) {
         throw "This installation of MailSite 11 requires an existing 32-bit MailSite $RequiredLegacyMajorVersion.x registry key at $MailSiteKey32."
@@ -595,6 +611,10 @@ function Assert-MailSite10 {
     }
 
     foreach ($service in $Services) {
+        if (-not (Test-MailSiteLegacyService -Service $service)) {
+            continue
+        }
+
         $exe = Join-Path $legacyInstallDir $service.File
         $fileVersion = Get-ProductVersion -Path $exe
         if ([string]::IsNullOrWhiteSpace($fileVersion) -or -not $fileVersion.StartsWith("$RequiredLegacyMajorVersion.")) {
@@ -1708,6 +1728,20 @@ function Install-MailSiteWindowsService {
     }
 }
 
+function Remove-MailSiteWindowsService {
+    param([string]$ServiceName)
+
+    if (-not (Test-MailSiteServiceInstalled -ServiceName $ServiceName)) {
+        return
+    }
+
+    Write-InstallerMessage "Removing newly created $ServiceName Windows service..."
+    & sc.exe delete $ServiceName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-InstallerMessage "Could not delete the newly created $ServiceName service. sc.exe exited with code $LASTEXITCODE." -Level "WARN"
+    }
+}
+
 function Set-FreshInstallDirectoryAcl {
     param(
         [string]$Directory,
@@ -1934,6 +1968,7 @@ function Install-MailSite {
 
     $state = $null
     $rollbackImagePath = @{}
+    $createdServices = @()
     $servicesStopped = $false
 
     try {
@@ -1976,15 +2011,21 @@ function Install-MailSite {
         }
 
         foreach ($service in $Services) {
-            $currentImagePath = Get-ServiceImagePath -ServiceName $service.Name
-            $rollbackImagePath[$service.Name] = $currentImagePath
-            if (-not $state.PreviousImagePath.ContainsKey($service.Name)) {
-                $state.PreviousImagePath[$service.Name] = $currentImagePath
+            if (Test-MailSiteServiceInstalled -ServiceName $service.Name) {
+                $currentImagePath = Get-ServiceImagePath -ServiceName $service.Name
+                $rollbackImagePath[$service.Name] = $currentImagePath
+                if (-not $state.PreviousImagePath.ContainsKey($service.Name)) {
+                    $state.PreviousImagePath[$service.Name] = $currentImagePath
+                }
+                if (-not $state.PreviousDescription.ContainsKey($service.Name)) {
+                    $state.PreviousDescription[$service.Name] = Get-ServiceDescription -ServiceName $service.Name
+                }
+                $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
+            } else {
+                Write-InstallerMessage "$($service.Name) Windows service is not installed; it will be created."
+                $rollbackImagePath[$service.Name] = $null
+                $state.WasRunning[$service.Name] = $false
             }
-            if (-not $state.PreviousDescription.ContainsKey($service.Name)) {
-                $state.PreviousDescription[$service.Name] = Get-ServiceDescription -ServiceName $service.Name
-            }
-            $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
         }
         $servicesStopped = $true
 
@@ -2006,17 +2047,23 @@ function Install-MailSite {
             if (-not (Test-Path -LiteralPath $newExe)) {
                 throw "Package did not install $newExe."
             }
-            Set-ServiceImagePath -ServiceName $service.Name -ExecutablePath $newExe
+            if (Test-MailSiteServiceInstalled -ServiceName $service.Name) {
+                Set-ServiceImagePath -ServiceName $service.Name -ExecutablePath $newExe
+            } else {
+                Install-MailSiteWindowsService -Service $service -ExecutablePath $newExe -ServiceAccount $null
+                $createdServices += $service.Name
+            }
             Set-ServiceDescription -ServiceName $service.Name -Description $service.Description
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
 
+        $startNewServices = (@($state.WasRunning.Values | Where-Object { $_ -eq $true }).Count -gt 0)
         $restartRequested = @()
         $restartFailures = @()
         foreach ($service in $Services) {
-            if ($state.WasRunning[$service.Name]) {
+            if ($state.WasRunning[$service.Name] -or ($startNewServices -and ($createdServices -contains $service.Name))) {
                 $restartRequested += $service.Name
                 if (-not (Start-MailSiteService -ServiceName $service.Name)) {
                     $restartFailures += $service.Name
@@ -2039,6 +2086,8 @@ function Install-MailSite {
                 if (-not [string]::IsNullOrWhiteSpace($previous)) {
                     $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
                     Set-ItemProperty -Path $path -Name ImagePath -Value $previous
+                } elseif ($createdServices -contains $service.Name) {
+                    Remove-MailSiteWindowsService -ServiceName $service.Name
                 }
                 if ($state.PreviousDescription.ContainsKey($service.Name)) {
                     Set-ServiceDescription -ServiceName $service.Name -Description $state.PreviousDescription[$service.Name]

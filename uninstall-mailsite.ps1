@@ -7,8 +7,8 @@ $ErrorActionPreference = "Stop"
 
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe" },
-    @{ Name = "EWSMA"; File = "ewsma.exe" },
-    @{ Name = "EASMA"; File = "easma.exe" },
+    @{ Name = "EWSMA"; File = "ewsma.exe"; LegacyService = $false },
+    @{ Name = "EASMA"; File = "easma.exe"; LegacyService = $false },
     @{ Name = "IMAP4A"; File = "imap4a.exe" },
     @{ Name = "POP3A"; File = "pop3a.exe" },
     @{ Name = "SMTPRA"; File = "smtpra.exe" },
@@ -126,6 +126,16 @@ function Get-ServiceImagePathExecutable {
     }
 
     return ($trimmed -split '\s+', 2)[0]
+}
+
+function Test-MailSiteLegacyService {
+    param([hashtable]$Service)
+
+    if ($Service.ContainsKey("LegacyService")) {
+        return [bool]$Service.LegacyService
+    }
+
+    return $true
 }
 
 function Resolve-UninstallServiceImagePath {
@@ -369,6 +379,10 @@ function Uninstall-MailSite {
     if (-not $freshInstall) {
         $unrevertable = @()
         foreach ($service in $Services) {
+            if (-not (Test-MailSiteLegacyService -Service $service)) {
+                continue
+            }
+
             $previous = $state.PreviousImagePath.($service.Name)
             $restorePath = Resolve-UninstallServiceImagePath -Service $service -SavedImagePath $previous
             if ([string]::IsNullOrWhiteSpace($restorePath)) {
@@ -412,9 +426,13 @@ function Uninstall-MailSite {
         }
     } else {
         foreach ($service in $Services) {
-            $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
-            Set-ItemProperty -Path $path -Name ImagePath -Value $restorePaths[$service.Name]
-            Write-UninstallerMessage "Restored $($service.Name) service path to $($restorePaths[$service.Name])."
+            if (Test-MailSiteLegacyService -Service $service) {
+                $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
+                Set-ItemProperty -Path $path -Name ImagePath -Value $restorePaths[$service.Name]
+                Write-UninstallerMessage "Restored $($service.Name) service path to $($restorePaths[$service.Name])."
+            } else {
+                Remove-MailSiteWindowsService -ServiceName $service.Name
+            }
         }
     }
 
