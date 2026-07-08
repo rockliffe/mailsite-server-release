@@ -162,6 +162,125 @@ function Test-MailSiteServiceInstalled {
     return ($null -ne (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue))
 }
 
+function Get-MailSiteServiceLogOnAccount {
+    param([string]$ServiceName)
+
+    $escapedName = $ServiceName.Replace("'", "''")
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='$escapedName'" -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        throw "Windows service '$ServiceName' is not installed."
+    }
+    if ([string]::IsNullOrWhiteSpace($service.StartName)) {
+        return $null
+    }
+
+    return [string]$service.StartName
+}
+
+function Normalize-ServiceLogOnAccount {
+    param([string]$AccountName)
+
+    if ([string]::IsNullOrWhiteSpace($AccountName)) {
+        return ""
+    }
+
+    $lower = $AccountName.Trim().ToLowerInvariant()
+    $withoutDot = if ($lower.StartsWith(".\")) { $lower.Substring(2) } else { $lower }
+    switch ($withoutDot) {
+        "localsystem" { return "nt authority\system" }
+        "system" { return "nt authority\system" }
+        "nt authority\system" { return "nt authority\system" }
+        "localservice" { return "nt authority\localservice" }
+        "nt authority\localservice" { return "nt authority\localservice" }
+        "networkservice" { return "nt authority\networkservice" }
+        "nt authority\networkservice" { return "nt authority\networkservice" }
+    }
+
+    if ($lower.StartsWith(".\")) {
+        $computer = if ([string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) { "" } else { ([string]$env:COMPUTERNAME).ToLowerInvariant() }
+        if ([string]::IsNullOrWhiteSpace($computer)) {
+            return $withoutDot
+        }
+        return "$computer\$withoutDot"
+    }
+
+    return $lower
+}
+
+function Format-ServiceLogOnAccount {
+    param([string]$AccountName)
+
+    switch (Normalize-ServiceLogOnAccount -AccountName $AccountName) {
+        "nt authority\system" { return "LocalSystem" }
+        "nt authority\localservice" { return "NT AUTHORITY\LocalService" }
+        "nt authority\networkservice" { return "NT AUTHORITY\NetworkService" }
+        default { return $AccountName.Trim() }
+    }
+}
+
+function Get-MailSiteServiceAccountAudit {
+    $accounts = [ordered]@{}
+    $groups = [ordered]@{}
+
+    foreach ($service in $Services) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $service.Name)) {
+            continue
+        }
+
+        try {
+            $account = Get-MailSiteServiceLogOnAccount -ServiceName $service.Name
+        } catch {
+            Write-InstallerMessage "Could not read the Log On As account for $($service.Name): $($_.Exception.Message)" -Level "WARN"
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($account)) {
+            continue
+        }
+
+        $accounts[$service.Name] = $account
+        $normalized = Normalize-ServiceLogOnAccount -AccountName $account
+        if (-not $groups.Contains($normalized)) {
+            $groups[$normalized] = [ordered]@{
+                Display = Format-ServiceLogOnAccount -AccountName $account
+                Services = @()
+            }
+        }
+        $groups[$normalized].Services += $service.Name
+    }
+
+    return @{
+        Accounts = $accounts
+        Groups = $groups
+        Mismatch = ($groups.Count -gt 1)
+    }
+}
+
+function Format-MailSiteServiceAccountGroups {
+    param([hashtable]$Audit)
+
+    if ($null -eq $Audit -or $null -eq $Audit.Groups) {
+        return ""
+    }
+
+    $parts = @()
+    foreach ($group in $Audit.Groups.Values) {
+        $parts += "$($group.Services -join ', ') = $($group.Display)"
+    }
+    return ($parts -join "; ")
+}
+
+function Write-MailSiteServiceAccountMismatchWarning {
+    param([hashtable]$Audit)
+
+    if ($null -eq $Audit -or -not [bool]$Audit.Mismatch) {
+        return
+    }
+
+    $summary = Format-MailSiteServiceAccountGroups -Audit $Audit
+    Write-InstallerMessage "MailSite Windows services are configured with different Log On As accounts: $summary. Configure all MailSite Windows services to use the same account, then restart them." -Level "WARN"
+}
+
 function Set-ServiceImagePath {
     param(
         [string]$ServiceName,
@@ -1848,6 +1967,8 @@ function Install-MailSiteFresh {
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
+        Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
+
         Set-FreshInstallDirectoryAcl -Directory $InstallDir -ServiceAccount $serviceAccount
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
@@ -1945,10 +2066,12 @@ function Install-MailSite {
     if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and (Test-ExactMailSiteVersion -Version $installedVersion)) {
         $requestedComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
         if ($requestedComparison -eq 0 -and -not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
+            Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
             Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
             return
         }
         if ($requestedComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
+            Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
             Write-InstallerMessage "MailSite $installedDisplayVersion is already installed, which includes a component newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
             return
         }
@@ -1980,6 +2103,7 @@ function Install-MailSite {
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
             $targetComparison = Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion
             if ($targetComparison -eq 0 -and -not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
+                Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
                 Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
                 Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
                 return
@@ -2056,6 +2180,8 @@ function Install-MailSite {
             Set-ServiceDescription -ServiceName $service.Name -Description $service.Description
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
+
+        Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
 
