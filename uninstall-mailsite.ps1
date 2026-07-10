@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe" },
     @{ Name = "EWSMA"; File = "ewsma.exe"; LegacyService = $false },
+    @{ Name = "MAPIMA"; File = "mapima.exe"; LegacyService = $false },
     @{ Name = "EASMA"; File = "easma.exe"; LegacyService = $false },
     @{ Name = "IMAP4A"; File = "imap4a.exe" },
     @{ Name = "POP3A"; File = "pop3a.exe" },

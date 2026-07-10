@@ -18,6 +18,7 @@ $ErrorActionPreference = "Stop"
 $Services = @(
     @{ Name = "HTTPMA"; File = "httpma.exe"; Description = "MailSite HTTP Management Agent" },
     @{ Name = "EWSMA"; File = "ewsma.exe"; Description = "MailSite EWS Management Agent"; LegacyService = $false },
+    @{ Name = "MAPIMA"; File = "mapima.exe"; Description = "MailSite MAPI Management Agent"; LegacyService = $false },
     @{ Name = "EASMA"; File = "easma.exe"; Description = "MailSite Exchange ActiveSync Management Agent"; LegacyService = $false },
     @{ Name = "IMAP4A"; File = "imap4a.exe"; Description = "MailSite IMAP4 Server" },
     @{ Name = "POP3A"; File = "pop3a.exe"; Description = "MailSite POP3 Agent"; VersionDetectionRequired = $false },
@@ -854,9 +855,12 @@ function Test-MailSiteOnlineLicenseValidation {
         }
 
     # Classify by HTTP status code first, then by response body shape:
-    #   2xx with a recognizable body -> definite valid/invalid result
-    #   4xx                          -> definite rejection
-    #   5xx / network error / unparseable 2xx -> unavailable (fail open)
+    #   2xx with a recognizable body        -> definite valid/invalid result
+    #   4xx with a recognizable JSON body   -> definite rejection
+    #   anything else (5xx, network error, CDN/proxy error pages, HTML 403s,
+    #   unparseable bodies)                 -> unavailable (fail open)
+    # A bare 4xx without our API's JSON shape is NOT a license verdict: an
+    # undeployed endpoint behind CloudFront answers 403 with an HTML page.
     $statusCode = 0
     if ($null -ne $response.StatusCode) {
         $statusCode = [int]$response.StatusCode
@@ -883,14 +887,12 @@ function Test-MailSiteOnlineLicenseValidation {
         # A 2xx body without the expected shape falls through to unavailable.
     }
 
-    if ($statusCode -ge 400 -and $statusCode -le 499) {
-        $status = $null
-        if ($null -ne $response.Body -and $response.Body.PSObject.Properties.Name -contains "status") {
-            $status = [string]$response.Body.status
-        }
+    if ($statusCode -ge 400 -and $statusCode -le 499 -and
+        $null -ne $response.Body -and
+        $response.Body.PSObject.Properties.Name -contains "status") {
         return @{
             Outcome = "invalid"
-            Status = $status
+            Status = [string]$response.Body.status
             Message = Get-MailSiteLicenseApiResponseMessage -Response $response
             Body = $response.Body
         }
@@ -1168,7 +1170,7 @@ function Resolve-RequestedPackageVersion {
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
-    $required = @("httpma.exe", "ewsma.exe", "easma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtpda.exe", "expresspro.exe", "console.exe")
+    $required = @("httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtpda.exe", "expresspro.exe", "console.exe")
     $hasExecutables = $required | Where-Object { Test-Path -LiteralPath (Join-Path $ExtractRoot $_) }
     if ($hasExecutables.Count -eq $required.Count) {
         return $ExtractRoot
