@@ -94,7 +94,30 @@ function Write-InstallerMessage {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$timestamp] [$Level] $Message"
     if (-not [string]::IsNullOrWhiteSpace($script:LogPath)) {
-        Add-Content -LiteralPath $script:LogPath -Value $line -Encoding UTF8
+        # A log-write failure must never abort an install (a mid-upgrade abort
+        # also skips rollback, leaving services stopped). Add-Content -Encoding
+        # can fail with "Stream was not readable" when another process holds
+        # install.log with an incompatible share mode, so append via .NET with
+        # permissive sharing and degrade to console-only logging on any error.
+        try {
+            $stream = [System.IO.FileStream]::new(
+                $script:LogPath,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite)
+            try {
+                $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+                $writer.WriteLine($line)
+                $writer.Flush()
+                $writer.Dispose()
+            } finally {
+                $stream.Dispose()
+            }
+        } catch {
+            $failedLogPath = $script:LogPath
+            $script:LogPath = $null
+            Write-Host "Could not write to install log $failedLogPath ($($_.Exception.Message)); continuing with console output only." -ForegroundColor Yellow
+        }
     }
 
     switch ($Level) {
