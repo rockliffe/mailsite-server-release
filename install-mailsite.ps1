@@ -910,7 +910,10 @@ function Save-MailSiteLicenseValidationCache {
     }
 
     try {
-        New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
+        # The cache lives in Log because the MailSite services run as a
+        # non-admin account with write access to Log but not the install root.
+        $cacheDirectory = Join-Path $InstallDirectory "Log"
+        New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
         $cache = [ordered]@{
             CachedAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             LicenseKey = $ValidationBody.license.licenseKey
@@ -919,7 +922,7 @@ function Save-MailSiteLicenseValidationCache {
             Validation = $ValidationBody.validation
             ValidationToken = $ValidationBody.validationToken
         }
-        $path = Join-Path $InstallDirectory $LicenseValidationCacheName
+        $path = Join-Path $cacheDirectory $LicenseValidationCacheName
         $cache | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
         Write-InstallerMessage "Cached signed license validation through $($ValidationBody.validation.graceUntil)."
     } catch {
@@ -2239,7 +2242,7 @@ function Resolve-FreshInstallLicenseKey {
 }
 
 function Get-FreshInstallLicenseKeyFromCache {
-    $cachePath = Join-Path $InstallDir $LicenseValidationCacheName
+    $cachePath = Join-Path (Join-Path $InstallDir "Log") $LicenseValidationCacheName
     if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
         throw "The interrupted fresh install has no signed license cache at $cachePath. Start over with uninstall-mailsite.ps1."
     }
