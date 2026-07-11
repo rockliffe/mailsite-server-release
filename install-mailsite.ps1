@@ -4,7 +4,7 @@ param(
     [string]$InstallTarget,
     [string]$InstallDir = (Join-Path $env:ProgramFiles "MailSite"),
     [string]$PackagePath,
-    [string]$PackageUrl = "https://github.com/rockliffe/mailsite-server-release/raw/main/MailSite.zip",
+    [string]$PackageUrl = "https://github.com/rockliffe/mailsite-server-release/releases/latest/download/MailSite.zip",
     [string]$LicenseApiBaseUrl
 )
 
@@ -32,7 +32,10 @@ $DesktopApps = @(
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
-$InstallMarkerName = ".mailsite11-install.json"
+$InstallMarkerName = "install.json"
+$InstallerStateVersion = 2
+$FreshInstallStatusInProgress = "InProgress"
+$FreshInstallStatusComplete = "Complete"
 $RequiredLegacyMajorVersion = "10"
 $TargetMajorVersion = "11"
 # DEV PHASE: points at mailsite.dev while v11 licensing is being tested.
@@ -41,9 +44,10 @@ $TargetMajorVersion = "11"
 $DefaultLicenseApiBaseUrl = "https://mailsite.dev"
 $FreshTrialLicenseRequest = "__MAILSITE_ONLINE_TRIAL__"
 $LicenseValidationCacheName = ".mailsite-license-validation.json"
-# Marks license-rejection throws from Assert-MailSite10 so upgrade paths can
-# tell them apart from "MailSite 10 is not present" failures.
+# Marks authoritative license failures from Assert-MailSite10 so upgrade paths
+# can tell them apart from "MailSite 10 is not present" failures.
 $LicenseRejectedMessagePrefix = "The existing MailSite license was rejected by the license service:"
+$LicenseUnavailableMessagePrefix = "The existing MailSite license could not be validated by the license service:"
 $WebView2RuntimeClientGuid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
 $WebView2BootstrapperUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 $script:LogPath = $null
@@ -76,7 +80,7 @@ function Initialize-InstallLog {
 
     $logDirectory = Join-Path $RootDirectory "Log"
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-    $script:LogPath = Join-Path $logDirectory "install-mailsite.log"
+    $script:LogPath = Join-Path $logDirectory "install.log"
     Write-InstallerMessage "MailSite installer started."
 }
 
@@ -170,6 +174,38 @@ function Get-ServiceImagePath {
     }
 
     return (Get-ItemProperty -Path $path -Name ImagePath).ImagePath
+}
+
+function Get-ServiceExecutablePathFromImagePath {
+    param([string]$ImagePath)
+
+    $value = ([string]$ImagePath).Trim()
+    if ($value -match '^"([^"]+)"') {
+        return $matches[1]
+    }
+    if ($value -match '^(.+?\.exe)(?:\s|$)') {
+        return $matches[1]
+    }
+    return $value
+}
+
+function Get-NormalizedMailSitePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path.Trim())
+    return $fullPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar).ToLowerInvariant()
+}
+
+function Test-MailSitePathEqual {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    return (Get-NormalizedMailSitePath -Path $Left) -ceq (Get-NormalizedMailSitePath -Path $Right)
 }
 
 function Test-MailSiteServiceInstalled {
@@ -625,16 +661,28 @@ function Get-ClusterVariantName {
 }
 
 function Get-ReleaseRepositoryInfo {
-    if ($PackageUrl -notmatch '^https://github\.com/([^/]+)/([^/]+)/raw/([^/]+)/[^/]+\.zip$') {
-        return $null
+    # Packages are published as GitHub Release assets (the zips exceed the
+    # 100 MB limit for committed files). The raw/<branch> form is still
+    # accepted for repos that keep small packages committed.
+    if ($PackageUrl -match '^https://github\.com/([^/]+)/([^/]+)/releases/(?:latest/download|download/[^/]+)/[^/]+\.zip$') {
+        return @{
+            Owner = $Matches[1]
+            Repo = $Matches[2]
+            UseReleases = $true
+        }
     }
 
-    return @{
-        Owner = $Matches[1]
-        Repo = $Matches[2]
-        Branch = $Matches[3]
-        RawBaseUrl = "https://github.com/$($Matches[1])/$($Matches[2])/raw/$($Matches[3])"
+    if ($PackageUrl -match '^https://github\.com/([^/]+)/([^/]+)/raw/([^/]+)/[^/]+\.zip$') {
+        return @{
+            Owner = $Matches[1]
+            Repo = $Matches[2]
+            Branch = $Matches[3]
+            UseReleases = $false
+            RawBaseUrl = "https://github.com/$($Matches[1])/$($Matches[2])/raw/$($Matches[3])"
+        }
     }
+
+    return $null
 }
 
 function Get-RemotePackageVersions {
@@ -645,15 +693,28 @@ function Get-RemotePackageVersions {
 
     $owner = $repoInfo.Owner
     $repo = $repoInfo.Repo
-    $branch = $repoInfo.Branch
-    $contentsUrl = "https://api.github.com/repos/$owner/$repo/contents?ref=$branch"
 
     try {
-        $items = Invoke-RestMethod -Uri $contentsUrl -UseBasicParsing
         $versions = @()
-        foreach ($item in $items) {
-            if ($item.name -match '^MailSite\.(11\.[0-9]+\.[0-9]+)\.zip$') {
-                $versions += [version]$Matches[1]
+        if ($repoInfo.UseReleases) {
+            $releasesUrl = "https://api.github.com/repos/$owner/$repo/releases?per_page=100"
+            $releases = Invoke-RestMethod -Uri $releasesUrl -UseBasicParsing
+            foreach ($release in $releases) {
+                if ($release.draft -or $release.prerelease) {
+                    continue
+                }
+                if ($release.tag_name -match '^v(11\.[0-9]+\.[0-9]+)$') {
+                    $versions += [version]$Matches[1]
+                }
+            }
+        } else {
+            $branch = $repoInfo.Branch
+            $contentsUrl = "https://api.github.com/repos/$owner/$repo/contents?ref=$branch"
+            $items = Invoke-RestMethod -Uri $contentsUrl -UseBasicParsing
+            foreach ($item in $items) {
+                if ($item.name -match '^MailSite\.(11\.[0-9]+\.[0-9]+)\.zip$') {
+                    $versions += [version]$Matches[1]
+                }
             }
         }
 
@@ -692,6 +753,10 @@ function Get-RemotePackageUrl {
     $repoInfo = Get-ReleaseRepositoryInfo
     if ($null -eq $repoInfo) {
         throw "Cannot resolve version-specific package URL from PackageUrl '$PackageUrl'. Pass -PackagePath or use the default release repository URL."
+    }
+
+    if ($repoInfo.UseReleases) {
+        return "https://github.com/$($repoInfo.Owner)/$($repoInfo.Repo)/releases/download/v$Version/MailSite.$Version.zip"
     }
 
     return "$($repoInfo.RawBaseUrl)/MailSite.$Version.zip"
@@ -818,7 +883,7 @@ function Save-MailSiteLicenseValidationCache {
     )
 
     if ($null -eq $ValidationBody -or [string]::IsNullOrWhiteSpace($ValidationBody.validationToken)) {
-        return
+        throw "The MailSite license service did not return the required signed validation assertion."
     }
 
     try {
@@ -826,10 +891,8 @@ function Save-MailSiteLicenseValidationCache {
         $cache = [ordered]@{
             CachedAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             LicenseKey = $ValidationBody.license.licenseKey
-            SerialNo = $ValidationBody.license.serialNo
-            ProductId = $ValidationBody.license.productId
-            ProductVersion = $ValidationBody.license.productVersion
-            Trial = [bool]$ValidationBody.license.trial
+            License = $ValidationBody.license
+            Decoded = $ValidationBody.decoded
             Validation = $ValidationBody.validation
             ValidationToken = $ValidationBody.validationToken
         }
@@ -837,7 +900,7 @@ function Save-MailSiteLicenseValidationCache {
         $cache | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
         Write-InstallerMessage "Cached signed license validation through $($ValidationBody.validation.graceUntil)."
     } catch {
-        Write-InstallerMessage "Could not write license validation cache: $($_.Exception.Message)" -Level "WARN"
+        throw "Could not write the required signed license validation cache: $($_.Exception.Message)"
     }
 }
 
@@ -858,7 +921,7 @@ function Test-MailSiteOnlineLicenseValidation {
     #   2xx with a recognizable body        -> definite valid/invalid result
     #   4xx with a recognizable JSON body   -> definite rejection
     #   anything else (5xx, network error, CDN/proxy error pages, HTML 403s,
-    #   unparseable bodies)                 -> unavailable (fail open)
+    #   unparseable bodies)                 -> unavailable (installation blocks)
     # A bare 4xx without our API's JSON shape is NOT a license verdict: an
     # undeployed endpoint behind CloudFront answers 403 with an HTML page.
     $statusCode = 0
@@ -866,8 +929,24 @@ function Test-MailSiteOnlineLicenseValidation {
         $statusCode = [int]$response.StatusCode
     }
 
+    $responseStatus = ""
+    if ($null -ne $response.Body -and
+        $response.Body.PSObject.Properties.Name -contains "status") {
+        $responseStatus = [string]$response.Body.status
+    }
+    if ($statusCode -eq 429 -or
+        $responseStatus -in @("rate_limited", "signing_unavailable")) {
+        return @{
+            Outcome = "unavailable"
+            Status = $responseStatus
+            Message = Get-MailSiteLicenseApiResponseMessage -Response $response
+            Body = $response.Body
+        }
+    }
+
     if ($statusCode -ge 200 -and $statusCode -le 299 -and $null -ne $response.Body) {
-        if ($response.Body.valid -eq $true) {
+        if ($response.Body.valid -eq $true -and
+            -not [string]::IsNullOrWhiteSpace($response.Body.validationToken)) {
             return @{
                 Outcome = "valid"
                 Status = [string]$response.Body.status
@@ -906,6 +985,33 @@ function Test-MailSiteOnlineLicenseValidation {
     }
 }
 
+function Assert-MailSiteLicenseValidatedOnline {
+    param(
+        [string]$LicenseKey,
+        [int[]]$AllowedProductMajors,
+        [string]$BlankLicenseWarning
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LicenseKey)) {
+        Write-InstallerMessage $BlankLicenseWarning -Level "WARN"
+        return
+    }
+
+    Write-InstallerMessage "Checking existing MailSite license with the MailSite license service..."
+    $licenseValidation = Test-MailSiteOnlineLicenseValidation `
+        -LicenseKey $LicenseKey `
+        -AllowedProductMajors $AllowedProductMajors
+    if ($licenseValidation.Outcome -eq "valid") {
+        Write-InstallerMessage "Existing MailSite license was accepted and signed by the license service."
+        Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $licenseValidation.Body
+        return
+    }
+    if ($licenseValidation.Outcome -eq "invalid") {
+        throw "$LicenseRejectedMessagePrefix $($licenseValidation.Message)"
+    }
+    throw "$LicenseUnavailableMessagePrefix $($licenseValidation.Message)"
+}
+
 function Assert-MailSite10 {
     if (-not (Test-Path $MailSiteKey32)) {
         throw "This installation of MailSite 11 requires an existing 32-bit MailSite $RequiredLegacyMajorVersion.x registry key at $MailSiteKey32."
@@ -923,22 +1029,10 @@ function Assert-MailSite10 {
     }
 
     $legacyLicenseKey = Get-RegistryString -Path $MailSiteKey32 -Name "License"
-    if ([string]::IsNullOrWhiteSpace($legacyLicenseKey)) {
-        # Legacy v10 DEMO installs store a blank License value; there is no key
-        # to validate online, so don't call the license service.
-        Write-InstallerMessage "The existing MailSite installation has no license key on record (legacy demo install). The upgraded server will need a valid MailSite license key." -Level "WARN"
-    } else {
-        Write-InstallerMessage "Checking existing MailSite license with the MailSite license service..."
-        $licenseValidation = Test-MailSiteOnlineLicenseValidation -LicenseKey $legacyLicenseKey -AllowedProductMajors @(10, 11)
-        if ($licenseValidation.Outcome -eq "valid") {
-            Write-InstallerMessage "Existing MailSite license was accepted by the license service."
-            Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $licenseValidation.Body
-        } elseif ($licenseValidation.Outcome -eq "invalid") {
-            throw "$LicenseRejectedMessagePrefix $($licenseValidation.Message)"
-        } else {
-            Write-InstallerMessage "Could not reach the MailSite license service; continuing with the local upgrade checks. $($licenseValidation.Message)" -Level "WARN"
-        }
-    }
+    Assert-MailSiteLicenseValidatedOnline `
+        -LicenseKey $legacyLicenseKey `
+        -AllowedProductMajors @(10, 11) `
+        -BlankLicenseWarning "The existing MailSite installation has no license key on record (legacy demo install). The upgraded server will need a valid MailSite license key."
 
     $legacyInstallDir = Get-RegistryString -Path $MailSiteKey32 -Name "InstallDir"
     if (-not (Test-Path -LiteralPath $legacyInstallDir -PathType Container)) {
@@ -1338,22 +1432,188 @@ function Get-MailSiteComponentVersionSummary {
     return ($parts -join ", ")
 }
 
+function Get-InstallMarkerPath {
+    param([string]$RootDirectory)
+
+    return Join-Path (Join-Path $RootDirectory "Log") $InstallMarkerName
+}
+
 function Save-InstallerState {
-    param([hashtable]$State)
+    param([object]$State)
 
     $json = $State | ConvertTo-Json -Depth 5
-    $markerPath = Join-Path $InstallDir $InstallMarkerName
-    Set-Content -Path $markerPath -Value $json -Encoding UTF8
+    $markerPath = Get-InstallMarkerPath -RootDirectory $InstallDir
+    $markerDirectory = Split-Path -Parent $markerPath
+    New-Item -ItemType Directory -Path $markerDirectory -Force | Out-Null
+    $transactionId = [Guid]::NewGuid().ToString('N')
+    $temporaryPath = "$markerPath.$transactionId.tmp"
+    $backupPath = "$markerPath.$transactionId.bak"
+    try {
+        $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText($temporaryPath, $json, $utf8WithoutBom)
+        if ([IO.File]::Exists($markerPath)) {
+            # PowerShell binds $null to an empty string for File.Replace's
+            # backup argument, which is not a legal path. Use a unique sibling
+            # backup and remove it immediately after the atomic replacement.
+            [IO.File]::Replace($temporaryPath, $markerPath, $backupPath)
+        } else {
+            [IO.File]::Move($temporaryPath, $markerPath)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-ExistingInstallerState {
-    $markerPath = Join-Path $InstallDir $InstallMarkerName
+    $markerPath = Get-InstallMarkerPath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $markerPath)) {
         return $null
     }
 
     $json = Get-Content -LiteralPath $markerPath -Raw
-    return $json | ConvertFrom-Json
+    $state = $json | ConvertFrom-Json
+    Assert-InstallerStateVersion -State $state
+    return $state
+}
+
+function Get-InstallerStatePropertyValue {
+    param(
+        [object]$State,
+        [string]$PropertyName
+    )
+
+    if ($null -eq $State) {
+        return $null
+    }
+    if ($State -is [System.Collections.IDictionary]) {
+        if ($State.Contains($PropertyName)) {
+            return $State[$PropertyName]
+        }
+        return $null
+    }
+    $property = $State.PSObject.Properties[$PropertyName]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Set-InstallerStatePropertyValue {
+    param(
+        [object]$State,
+        [string]$PropertyName,
+        [object]$Value
+    )
+
+    if ($State -is [System.Collections.IDictionary]) {
+        $State[$PropertyName] = $Value
+        return
+    }
+    $State | Add-Member -NotePropertyName $PropertyName -NotePropertyValue $Value -Force
+}
+
+function Assert-InstallerStateVersion {
+    param([object]$State)
+
+    if ($null -eq $State) {
+        return
+    }
+    $stateVersion = Get-InstallerStatePropertyValue -State $State -PropertyName "StateVersion"
+    if ($null -ne $stateVersion -and [int]$stateVersion -ne $InstallerStateVersion) {
+        throw "Installer state uses unsupported StateVersion '$stateVersion'."
+    }
+}
+
+function Get-InstallerStateStatus {
+    param([object]$State)
+
+    Assert-InstallerStateVersion -State $State
+    $status = Get-InstallerStatePropertyValue -State $State -PropertyName "InstallStatus"
+    if ([string]::IsNullOrWhiteSpace([string]$status)) {
+        # Version-1 markers had no status. Callers that need recovery semantics
+        # corroborate them against the registry/services; other paths retain
+        # the historical assumption that a missing status means Complete.
+        return $FreshInstallStatusComplete
+    }
+    if ($status -ne $FreshInstallStatusInProgress -and $status -ne $FreshInstallStatusComplete) {
+        throw "Installer state contains unsupported InstallStatus '$status'."
+    }
+    return [string]$status
+}
+
+function Test-InProgressFreshInstall {
+    param([object]$State)
+
+    if ($null -eq $State -or -not [bool](Get-InstallerStatePropertyValue -State $State -PropertyName "FreshInstall")) {
+        return $false
+    }
+    return (Get-InstallerStateStatus -State $State) -eq $FreshInstallStatusInProgress
+}
+
+function Test-LegacyFreshInstallMarker {
+    param([object]$State)
+
+    if ($null -eq $State -or -not [bool](Get-InstallerStatePropertyValue -State $State -PropertyName "FreshInstall")) {
+        return $false
+    }
+    return $null -eq (Get-InstallerStatePropertyValue -State $State -PropertyName "StateVersion") -and
+        $null -eq (Get-InstallerStatePropertyValue -State $State -PropertyName "InstallStatus")
+}
+
+function Test-LegacyFreshInstallComplete {
+    param([object]$State)
+
+    if (-not (Test-LegacyFreshInstallMarker -State $State) -or -not (Test-Path -LiteralPath $MailSiteKey32)) {
+        return $false
+    }
+    $majorVersion = Get-RegistryValue -Path $MailSiteKey32 -Name "ServerMajorVersion"
+    $registryInstallDir = [string](Get-RegistryValue -Path $MailSiteKey32 -Name "InstallDir11")
+    if ([int]$majorVersion -ne 11 -or -not (Test-MailSitePathEqual -Left $registryInstallDir -Right $InstallDir)) {
+        return $false
+    }
+    foreach ($service in $Services) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $service.Name)) {
+            return $false
+        }
+        $actualExecutable = Get-ServiceExecutablePathFromImagePath -ImagePath (Get-ServiceImagePath -ServiceName $service.Name)
+        if (-not (Test-MailSitePathEqual -Left $actualExecutable -Right (Join-Path $InstallDir $service.File))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-FreshInstallStateDirectory {
+    param([object]$State)
+
+    $stateDirectory = [string](Get-InstallerStatePropertyValue -State $State -PropertyName "InstallDir11")
+    if ([string]::IsNullOrWhiteSpace($stateDirectory) -or -not (Test-MailSitePathEqual -Left $stateDirectory -Right $InstallDir)) {
+        throw "Interrupted fresh-install state belongs to '$stateDirectory', not '$InstallDir'. Rerun the installer with the original -InstallDir."
+    }
+}
+
+function New-FreshInstallState {
+    param(
+        [string]$TargetVersion,
+        [string]$DomainName,
+        [string]$ServiceAccountName
+    )
+
+    return @{
+        StateVersion = $InstallerStateVersion
+        InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
+        InstallDir11 = $InstallDir
+        TargetVersion = $TargetVersion
+        FreshInstall = $true
+        InstallStatus = $FreshInstallStatusInProgress
+        DomainName = $DomainName
+        ServiceAccountName = $ServiceAccountName
+        ProductRegistryExistedBefore = $false
+        PreviousImagePath = @{}
+        PreviousDescription = @{}
+        WasRunning = @{}
+    }
 }
 
 function Copy-StateMap {
@@ -1883,7 +2143,9 @@ function Request-MailSiteTrialLicense {
             -Body @{} `
             -WebSession $session
 
-        if ($trial.Ok -and $null -ne $trial.Body -and $trial.Body.valid -eq $true -and -not [string]::IsNullOrWhiteSpace($trial.Body.license.licenseKey)) {
+        if ($trial.Ok -and $null -ne $trial.Body -and $trial.Body.valid -eq $true -and
+            -not [string]::IsNullOrWhiteSpace($trial.Body.license.licenseKey) -and
+            -not [string]::IsNullOrWhiteSpace($trial.Body.validationToken)) {
             return @{
                 LicenseKey = [string]$trial.Body.license.licenseKey
                 IsTrial = [bool]$trial.Body.license.trial
@@ -1901,7 +2163,6 @@ function Request-MailSiteTrialLicense {
 
 function Resolve-FreshInstallLicenseKey {
     param(
-        [string]$HttpmaPath,
         [string]$InitialKey
     )
 
@@ -1920,59 +2181,55 @@ function Resolve-FreshInstallLicenseKey {
             $trialResolution = $trial
         }
 
-        Write-InstallerMessage "Validating MailSite license key..."
-        $result = Invoke-MailSiteExecutable -FilePath $HttpmaPath -ArgumentList @("license-info", "--require-current", $key)
-        if ($result.ExitCode -eq 0) {
-            foreach ($line in @($result.Output)) {
-                if (-not [string]::IsNullOrWhiteSpace($line)) {
-                    Write-InstallerMessage "  $line"
-                }
-            }
-
-            if ($null -ne $trialResolution -and $null -ne $trialResolution.OnlineValidation) {
-                # Trial issuance already returned a signed validation payload;
-                # use it instead of a redundant re-validate that could
-                # transiently fail and drop the trial marker.
-                Write-InstallerMessage "Using the license validation returned with the MailSite trial license."
-                Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $trialResolution.OnlineValidation
-                return @{
-                    LicenseKey = $key
-                    IsTrial = $true
-                    OnlineValidation = $trialResolution.OnlineValidation
-                    Summary = $trialResolution.Summary
-                }
-            }
-
-            $onlineValidation = Test-MailSiteOnlineLicenseValidation -LicenseKey $key -AllowedProductMajors @([int]$TargetMajorVersion)
-            if ($onlineValidation.Outcome -eq "valid") {
-                Write-InstallerMessage "MailSite license service accepted the license key."
-                Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $onlineValidation.Body
-                return @{
-                    LicenseKey = $key
-                    IsTrial = [bool]$onlineValidation.Body.license.trial
-                    OnlineValidation = $onlineValidation.Body
-                    Summary = "$($onlineValidation.Body.license.package), expires $($onlineValidation.Body.license.expiresAt)"
-                }
-            }
-            if ($onlineValidation.Outcome -eq "invalid") {
-                Write-InstallerMessage "The license service rejected the key: $($onlineValidation.Message)" -Level "WARN"
-                $key = Read-FreshInstallLicenseKeyRetry
-                continue
-            }
-
-            Write-InstallerMessage "Could not reach the MailSite license service; accepting the locally decoded license. $($onlineValidation.Message)" -Level "WARN"
+        if ($null -ne $trialResolution -and $null -ne $trialResolution.OnlineValidation) {
+            # Trial issuance already returned the mandatory signed website
+            # assertion; use it instead of making a redundant request.
+            Write-InstallerMessage "Using the signed validation returned with the MailSite trial license."
+            Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $trialResolution.OnlineValidation
             return @{
                 LicenseKey = $key
-                IsTrial = $false
-                OnlineValidation = $null
-                Summary = $null
+                IsTrial = $true
+                OnlineValidation = $trialResolution.OnlineValidation
+                Summary = $trialResolution.Summary
             }
         }
 
-        $detail = (@($result.Output) -join "; ").Trim()
-        Write-InstallerMessage "The license key was not accepted: $detail" -Level "WARN"
+        Write-InstallerMessage "Validating MailSite license key with the MailSite license service..."
+        $onlineValidation = Test-MailSiteOnlineLicenseValidation -LicenseKey $key -AllowedProductMajors @([int]$TargetMajorVersion)
+        if ($onlineValidation.Outcome -eq "valid") {
+            Write-InstallerMessage "MailSite license service accepted the license key and returned a signed assertion."
+            Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $onlineValidation.Body
+            return @{
+                LicenseKey = $key
+                IsTrial = [bool]$onlineValidation.Body.license.trial
+                OnlineValidation = $onlineValidation.Body
+                Summary = "$($onlineValidation.Body.license.package), expires $($onlineValidation.Body.license.expiresAt)"
+            }
+        }
+        if ($onlineValidation.Outcome -eq "invalid") {
+            Write-InstallerMessage "The license service rejected the key: $($onlineValidation.Message)" -Level "WARN"
+        } else {
+            Write-InstallerMessage "The license service is unavailable; installation cannot continue without a signed website assertion. $($onlineValidation.Message)" -Level "WARN"
+        }
         $key = Read-FreshInstallLicenseKeyRetry
     }
+}
+
+function Get-FreshInstallLicenseKeyFromCache {
+    $cachePath = Join-Path $InstallDir $LicenseValidationCacheName
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        throw "The interrupted fresh install has no signed license cache at $cachePath. Start over with uninstall-mailsite.ps1."
+    }
+    try {
+        $cache = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+    } catch {
+        throw "The signed license cache at $cachePath is not valid JSON. Start over with uninstall-mailsite.ps1. $($_.Exception.Message)"
+    }
+    $licenseKey = [string]$cache.LicenseKey
+    if ([string]::IsNullOrWhiteSpace($licenseKey)) {
+        throw "The signed license cache at $cachePath does not contain its license key. Start over with uninstall-mailsite.ps1."
+    }
+    return $licenseKey.Trim()
 }
 
 function Read-FreshInstallPostmasterPassword {
@@ -2046,15 +2303,32 @@ function Read-FreshInstallServiceAccount {
             $candidate = "$env:COMPUTERNAME\$($parts[1])"
         }
 
-        $password = Read-MaskedInput -Prompt "Password for $candidate"
-        Write-InstallerMessage "Validating credentials for $candidate..."
-        if (Test-ServiceAccountCredential -UserName $candidate -Password $password) {
-            Write-InstallerMessage "Credentials for $candidate were validated."
-            return @{ UserName = $candidate; Password = $password }
-        }
-
-        Write-Host "Could not validate the credentials for '$candidate'. Please try again." -ForegroundColor Yellow
+        return Read-ValidatedFreshInstallServiceAccount -AccountName $candidate
     }
+}
+
+function Read-ValidatedFreshInstallServiceAccount {
+    param([string]$AccountName)
+
+    while ($true) {
+        $password = Read-MaskedInput -Prompt "Password for $AccountName"
+        Write-InstallerMessage "Validating credentials for $AccountName..."
+        if (Test-ServiceAccountCredential -UserName $AccountName -Password $password) {
+            Write-InstallerMessage "Credentials for $AccountName were validated."
+            return @{ UserName = $AccountName; Password = $password }
+        }
+        Write-Host "Could not validate the credentials for '$AccountName'. Please try again." -ForegroundColor Yellow
+    }
+}
+
+function Read-ResumedFreshInstallServiceAccount {
+    param([string]$AccountName)
+
+    if ([string]::IsNullOrWhiteSpace($AccountName) -or $AccountName -ieq "LocalSystem") {
+        return $null
+    }
+    Write-Host "The interrupted install configured MailSite services to run as $AccountName."
+    return Read-ValidatedFreshInstallServiceAccount -AccountName $AccountName
 }
 
 function Add-LsaRightsType {
@@ -2200,7 +2474,10 @@ function Install-MailSiteWindowsService {
 }
 
 function Remove-MailSiteWindowsService {
-    param([string]$ServiceName)
+    param(
+        [string]$ServiceName,
+        [switch]$RequireRemoval
+    )
 
     if (-not (Test-MailSiteServiceInstalled -ServiceName $ServiceName)) {
         return
@@ -2209,7 +2486,81 @@ function Remove-MailSiteWindowsService {
     Write-InstallerMessage "Removing newly created $ServiceName Windows service..."
     & sc.exe delete $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-InstallerMessage "Could not delete the newly created $ServiceName service. sc.exe exited with code $LASTEXITCODE." -Level "WARN"
+        $message = "Could not delete the newly created $ServiceName service. sc.exe exited with code $LASTEXITCODE."
+        if ($RequireRemoval) {
+            throw $message
+        }
+        Write-InstallerMessage $message -Level "WARN"
+        return
+    }
+    if ($RequireRemoval) {
+        Wait-MailSiteServiceRemoved -ServiceName $ServiceName
+    }
+}
+
+function Wait-MailSiteServiceRemoved {
+    param(
+        [string]$ServiceName,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $ServiceName)) {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "Timed out waiting for the $ServiceName Windows service to be removed."
+}
+
+function Get-InstalledMailSiteServiceNames {
+    $installed = @()
+    foreach ($service in $Services) {
+        if (Test-MailSiteServiceInstalled -ServiceName $service.Name) {
+            $installed += $service.Name
+        }
+    }
+    return $installed
+}
+
+function Assert-NewFreshInstallHasNoServices {
+    $installed = @(Get-InstalledMailSiteServiceNames)
+    if ($installed.Count -gt 0) {
+        throw "No MailSite registry or v11 installation was found, but these MailSite service names already exist: $($installed -join ', '). Refusing to overwrite services that are not owned by a fresh-install marker."
+    }
+}
+
+function Remove-InProgressFreshServices {
+    param([object]$State)
+
+    if (-not (Test-InProgressFreshInstall -State $State)) {
+        throw "Fresh-install service recovery requires an explicit InProgress fresh-install marker."
+    }
+    Assert-FreshInstallStateDirectory -State $State
+
+    # Validate ownership for every present service before deleting any of them.
+    # This prevents a stale marker from partially removing a legacy or custom
+    # installation that happens to reuse one of the MailSite service names.
+    $ownedServices = @()
+    foreach ($service in $Services) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $service.Name)) {
+            continue
+        }
+        $imagePath = Get-ServiceImagePath -ServiceName $service.Name
+        $actualExecutable = Get-ServiceExecutablePathFromImagePath -ImagePath $imagePath
+        $expectedExecutable = Join-Path $InstallDir $service.File
+        if (-not (Test-MailSitePathEqual -Left $actualExecutable -Right $expectedExecutable)) {
+            throw "Cannot recover the interrupted fresh install because service $($service.Name) points to '$actualExecutable', not the owned path '$expectedExecutable'. No services were removed."
+        }
+        $ownedServices += $service.Name
+    }
+
+    foreach ($serviceName in $ownedServices) {
+        if (Test-MailSiteServiceInstalled -ServiceName $serviceName) {
+            Stop-MailSiteService -ServiceName $serviceName | Out-Null
+        }
+        Remove-MailSiteWindowsService -ServiceName $serviceName -RequireRemoval
     }
 }
 
@@ -2234,73 +2585,184 @@ function Set-FreshInstallDirectoryAcl {
     $result = Invoke-MailSiteExecutable -FilePath "icacls.exe" -ArgumentList $arguments
     if ($result.ExitCode -ne 0) {
         $detail = (@($result.Output) -join [Environment]::NewLine).Trim()
-        Write-InstallerMessage "Could not update permissions on ${Directory}: icacls.exe exited with code $($result.ExitCode). $detail" -Level "WARN"
+        throw "Could not update permissions on ${Directory}: icacls.exe exited with code $($result.ExitCode). $detail"
+    }
+}
+
+function Assert-FreshInstallExecutablesPresent {
+    foreach ($service in $Services) {
+        $executable = Join-Path $InstallDir $service.File
+        if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "Package did not install $executable."
+        }
     }
 }
 
 function Install-MailSiteFresh {
-    Write-InstallerMessage "No existing MailSite installation was detected. Preparing a fresh MailSite $TargetMajorVersion install."
+    param(
+        [object]$ResumeState = $null,
+        [object]$LegacyRecoveryState = $null
+    )
 
-    $installRequest = Resolve-InstallRequest
-    $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
+    $isResume = $null -ne $ResumeState
+    $isLegacyRecovery = $null -ne $LegacyRecoveryState
+    if ($isResume -and $isLegacyRecovery) {
+        throw "Fresh install cannot use current and legacy recovery state together."
+    }
+    $freshState = $ResumeState
+    $extractRoot = $null
 
-    Write-Host ""
-    Write-Host "MailSite 11 Fresh Install"
-    Write-Host "========================="
-    Write-Host "No existing MailSite installation was detected on this machine."
-    Write-Host (Format-InstallerConsoleMessage -Message "This script will perform a fresh install of MailSite $requestedVersion.")
-    Write-Host "Install directory: $InstallDir"
-    Write-Host ""
-    if (-not (Read-YesNo -Prompt "Install MailSite ${requestedVersion}?" -DefaultYes $true)) {
-        Write-InstallerMessage "Installation cancelled by user."
-        return
+    if ($isResume) {
+        if (-not (Test-InProgressFreshInstall -State $ResumeState)) {
+            throw "Only an explicit InProgress fresh-install marker can be resumed."
+        }
+        Assert-FreshInstallStateDirectory -State $ResumeState
+        $requestedVersion = [string](Get-InstallerStatePropertyValue -State $ResumeState -PropertyName "TargetVersion")
+        $domainName = [string](Get-InstallerStatePropertyValue -State $ResumeState -PropertyName "DomainName")
+        $serviceAccountName = [string](Get-InstallerStatePropertyValue -State $ResumeState -PropertyName "ServiceAccountName")
+        if (-not (Test-ExactMailSiteVersion -Version $requestedVersion) -or [string]::IsNullOrWhiteSpace($domainName)) {
+            throw "The interrupted fresh-install marker is missing a valid target version or domain name. Run uninstall-mailsite.ps1 and start again."
+        }
+
+        Write-InstallerMessage "Detected an interrupted MailSite $requestedVersion fresh install."
+        Write-Host ""
+        Write-Host "MailSite 11 Fresh Install Recovery"
+        Write-Host "=================================="
+        Write-Host (Format-InstallerConsoleMessage -Message "An incomplete MailSite $requestedVersion install can be resumed safely.")
+        Write-Host "Install directory: $InstallDir"
+        Write-Host "Default domain:    $domainName"
+        Write-Host ""
+        if (-not (Read-YesNo -Prompt "Resume the interrupted fresh install?" -DefaultYes $true)) {
+            Write-InstallerMessage "Fresh-install recovery cancelled by user."
+            return
+        }
+
+        # Neither password is persisted. Re-prompting lets idempotent setup
+        # replace a password that may have been written but never displayed.
+        $licenseKey = Get-FreshInstallLicenseKeyFromCache
+        $postmaster = Read-FreshInstallPostmasterPassword
+        $serviceAccount = Read-ResumedFreshInstallServiceAccount -AccountName $serviceAccountName
+        $installRequest = @{ RemoteVersion = $requestedVersion }
+    } else {
+        if ($isLegacyRecovery) {
+            Write-InstallerMessage "Preparing to recover the interrupted fresh install written by the previous installer version."
+        } else {
+            Write-InstallerMessage "No existing MailSite installation was detected. Preparing a fresh MailSite $TargetMajorVersion install."
+        }
+        Assert-NewFreshInstallHasNoServices
+        $legacyTargetVersion = [string](Get-InstallerStatePropertyValue -State $LegacyRecoveryState -PropertyName "TargetVersion")
+        if ($isLegacyRecovery -and (Test-ExactMailSiteVersion -Version $legacyTargetVersion)) {
+            $installRequest = @{ RemoteVersion = $legacyTargetVersion }
+        } else {
+            $installRequest = Resolve-InstallRequest
+        }
+        $legacyStagedPackage = Join-Path $InstallDir "MailSite.zip"
+        if ($isLegacyRecovery -and (Test-Path -LiteralPath $legacyStagedPackage -PathType Leaf)) {
+            $requestedVersion = Get-PackageVersionFromZip -Path $legacyStagedPackage
+            if ((Test-ExactMailSiteVersion -Version $legacyTargetVersion) -and $requestedVersion -ne $legacyTargetVersion) {
+                throw "The interrupted marker requires MailSite $legacyTargetVersion, but its staged package is $requestedVersion."
+            }
+        } else {
+            $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
+        }
+
+        Write-Host ""
+        Write-Host "MailSite 11 Fresh Install"
+        Write-Host "========================="
+        if ($isLegacyRecovery) {
+            Write-Host "The previous installer stopped before it recorded enough state to resume automatically."
+        } else {
+            Write-Host "No existing MailSite installation was detected on this machine."
+        }
+        Write-Host (Format-InstallerConsoleMessage -Message "This script will perform a fresh install of MailSite $requestedVersion.")
+        Write-Host "Install directory: $InstallDir"
+        Write-Host ""
+        if (-not (Read-YesNo -Prompt "Install MailSite ${requestedVersion}?" -DefaultYes $true)) {
+            Write-InstallerMessage "Installation cancelled by user."
+            return
+        }
+
+        # Gather secrets before the long-running package work. License key
+        # decoding/validation remains website-only; only its signed assertion
+        # is cached for setup and runtime verification.
+        Write-Host ""
+        Write-Host "MailSite setup needs a few details before installing."
+        if ($isLegacyRecovery) {
+            try {
+                $licenseKey = Get-FreshInstallLicenseKeyFromCache
+                Write-InstallerMessage "Recovered the website-validated license key from the interrupted install's signed cache."
+            } catch {
+                Write-InstallerMessage "The interrupted install's license cache cannot be reused: $($_.Exception.Message)" -Level "WARN"
+                $licenseKey = Read-FreshInstallLicenseKeyText
+            }
+        } else {
+            $licenseKey = Read-FreshInstallLicenseKeyText
+        }
+        $domainName = Read-FreshInstallDomainName
+        $postmaster = Read-FreshInstallPostmasterPassword
+        $serviceAccount = Read-FreshInstallServiceAccount
     }
 
-    # Gather all interactive input before the long-running download/extract steps.
-    # The purchased license key text is collected here and validated after
-    # extraction, once the packaged httpma.exe is available to decode it. Trial
-    # requests are fulfilled online at that point too, so setup receives a real
-    # MailSite license key instead of the old local DEMO placeholder.
-    Write-Host ""
-    Write-Host "MailSite setup needs a few details before installing."
-    $licenseKey = Read-FreshInstallLicenseKeyText
-    $domainName = Read-FreshInstallDomainName
-    $postmaster = Read-FreshInstallPostmasterPassword
-    $serviceAccount = Read-FreshInstallServiceAccount
-
-    $package = Resolve-PackagePath -DestinationDirectory $InstallDir -RemoteVersion $installRequest.RemoteVersion
-    $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
-
     try {
+        if ($isResume) {
+            # A prior exe may have registered its SCM entry before failing its
+            # post-install work. Remove only services proven to belong to this
+            # marker, then reinstall every service under one consistent account.
+            Remove-InProgressFreshServices -State $freshState
+        }
+
+        $package = $null
+        $stagedPackage = Join-Path $InstallDir "MailSite.zip"
+        if (($isResume -or $isLegacyRecovery) -and (Test-Path -LiteralPath $stagedPackage -PathType Leaf)) {
+            try {
+                if ((Get-PackageVersionFromZip -Path $stagedPackage) -eq $requestedVersion) {
+                    $package = $stagedPackage
+                    Write-InstallerMessage "Reusing the staged MailSite $requestedVersion package."
+                }
+            } catch {
+                Write-InstallerMessage "The staged package cannot be reused: $($_.Exception.Message)" -Level "WARN"
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($package)) {
+            $package = Resolve-PackagePath -DestinationDirectory $InstallDir -RemoteVersion $installRequest.RemoteVersion
+        }
+
+        $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("MailSite11-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
         Write-InstallerMessage "Extracting $package..."
         Expand-Archive -Path $package -DestinationPath $extractRoot -Force
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
+        if (($isResume -or $isLegacyRecovery) -and $targetVersion -ne $requestedVersion) {
+            throw "Interrupted fresh install requires MailSite $requestedVersion, but the prepared package is $targetVersion."
+        }
 
-        $licenseResolution = Resolve-FreshInstallLicenseKey -HttpmaPath (Join-Path $packageRoot "httpma.exe") -InitialKey $licenseKey
+        $licenseResolution = Resolve-FreshInstallLicenseKey -InitialKey $licenseKey
         $licenseKey = $licenseResolution.LicenseKey
         $licenseIsTrial = [bool]$licenseResolution.IsTrial
         $licenseSummary = $licenseResolution.Summary
+
+        if (-not $isResume) {
+            if (Test-Path -LiteralPath $MailSiteKey32) {
+                throw "The MailSite product registry key appeared during fresh-install preflight. Refusing to overwrite configuration that this attempt does not own."
+            }
+            $serviceAccountName = if ($null -eq $serviceAccount) { "" } else { $serviceAccount.UserName }
+            $freshState = New-FreshInstallState `
+                -TargetVersion $targetVersion `
+                -DomainName $domainName `
+                -ServiceAccountName $serviceAccountName
+        }
+        Set-InstallerStatePropertyValue -State $freshState -PropertyName "InstallStatus" -Value $FreshInstallStatusInProgress
+        Set-InstallerStatePropertyValue -State $freshState -PropertyName "LastAttemptAtUtc" -Value ([DateTimeOffset]::UtcNow.ToString("o"))
+        # This atomic marker precedes every machine mutation after license and
+        # package validation, so a power loss always leaves a resumable owner.
+        Save-InstallerState -State $freshState
 
         Install-WebView2Runtime
 
         Write-InstallerMessage "Installing MailSite $targetVersion to $InstallDir..."
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
         New-MailSiteDesktopShortcuts -RootDirectory $InstallDir
-
-        # Save the marker before configuring services so a failed install can still
-        # be cleaned up with uninstall-mailsite.ps1. FreshInstall tells the
-        # uninstaller to delete the services instead of reverting to MailSite 10.
-        Save-InstallerState -State @{
-            InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
-            InstallDir11 = $InstallDir
-            TargetVersion = $targetVersion
-            FreshInstall = $true
-            PreviousImagePath = @{}
-            PreviousDescription = @{}
-            WasRunning = @{}
-        }
 
         Invoke-MailSiteFreshSetup `
             -HttpmaPath (Join-Path $InstallDir "httpma.exe") `
@@ -2313,12 +2775,11 @@ function Install-MailSiteFresh {
         if ($null -ne $serviceAccount) {
             Grant-ServiceLogonRight -AccountName $serviceAccount.UserName
         }
+        Set-FreshInstallDirectoryAcl -Directory $InstallDir -ServiceAccount $serviceAccount
+        Assert-FreshInstallExecutablesPresent
 
         foreach ($service in $Services) {
             $newExe = Join-Path $InstallDir $service.File
-            if (-not (Test-Path -LiteralPath $newExe)) {
-                throw "Package did not install $newExe."
-            }
             Install-MailSiteWindowsService -Service $service -ExecutablePath $newExe -ServiceAccount $serviceAccount
             Set-ServiceDescription -ServiceName $service.Name -Description $service.Description
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
@@ -2326,16 +2787,38 @@ function Install-MailSiteFresh {
 
         Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
 
-        Set-FreshInstallDirectoryAcl -Directory $InstallDir -ServiceAccount $serviceAccount
-
-        Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
-
         $startFailures = @()
         foreach ($service in $Services) {
             if (-not (Start-MailSiteService -ServiceName $service.Name)) {
                 $startFailures += $service.Name
             }
         }
+        if ($startFailures.Count -gt 0) {
+            throw "Fresh install could not start these MailSite services: $($startFailures -join ', ')."
+        }
+
+        if ($postmaster.Generated) {
+            Write-Host ""
+            Write-Host "  A password was generated for Postmaster@${domainName}:" -ForegroundColor Yellow
+            Write-Host "      $($postmaster.Password)" -ForegroundColor Cyan
+            Write-Host "  Record this password now. It is not saved anywhere else and will not be shown again." -ForegroundColor Yellow
+            [void](Read-Host "Press Enter after you have recorded the Postmaster password")
+            Write-InstallerMessage "An autogenerated Postmaster password was displayed and acknowledged by the operator (not written to this log)."
+        }
+
+        # Commit completion only after every service is running and any
+        # one-time generated password has been delivered and acknowledged.
+        Set-InstallerStatePropertyValue -State $freshState -PropertyName "InstallStatus" -Value $FreshInstallStatusComplete
+        Set-InstallerStatePropertyValue -State $freshState -PropertyName "CompletedAtUtc" -Value ([DateTimeOffset]::UtcNow.ToString("o"))
+        try {
+            Save-InstallerState -State $freshState
+        } catch {
+            # Keep the in-memory state aligned with the still-InProgress marker
+            # so the outer failure handler removes the services it just started.
+            Set-InstallerStatePropertyValue -State $freshState -PropertyName "InstallStatus" -Value $FreshInstallStatusInProgress
+            throw
+        }
+        Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
 
         $serviceAccountDisplay = if ($null -eq $serviceAccount) { "LocalSystem" } else { $serviceAccount.UserName }
         Write-Host ""
@@ -2349,18 +2832,21 @@ function Install-MailSiteFresh {
         } elseif (-not [string]::IsNullOrWhiteSpace($licenseSummary)) {
             Write-InstallerMessage "  License:            $licenseSummary"
         }
-        if ($postmaster.Generated) {
-            Write-Host ""
-            Write-Host "  A password was generated for Postmaster@${domainName}:" -ForegroundColor Yellow
-            Write-Host "      $($postmaster.Password)" -ForegroundColor Cyan
-            Write-Host "  Record this password now. It is not saved anywhere else and will not be shown again." -ForegroundColor Yellow
-            Write-InstallerMessage "An autogenerated Postmaster password was displayed to the operator (not written to this log)."
+    } catch {
+        $installFailure = $_.Exception
+        if ($null -ne $freshState -and (Test-InProgressFreshInstall -State $freshState)) {
+            Write-InstallerMessage "Fresh install is incomplete. Removing services owned by this attempt; staged files and configuration are retained for a safe retry." -Level "WARN"
+            try {
+                Remove-InProgressFreshServices -State $freshState
+            } catch {
+                Write-InstallerMessage "Could not fully clean up fresh-install services: $($_.Exception.Message)" -Level "WARN"
+            }
         }
-        if ($startFailures.Count -gt 0) {
-            Write-InstallerMessage "These services could not be started and may need attention: $($startFailures -join ', ')." -Level "WARN"
-        }
+        throw $installFailure
     } finally {
-        Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($extractRoot)) {
+            Remove-Item -Path $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -2368,6 +2854,29 @@ function Install-MailSite {
     Assert-Administrator
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Initialize-InstallLog -RootDirectory $InstallDir
+
+    # Explicit state takes precedence over binary/registry heuristics. A fresh
+    # attempt may have copied every executable and written part of the registry
+    # before failing; classifying that as an upgrade would skip setup and lose
+    # the selected service account.
+    $installerState = Get-ExistingInstallerState
+    if (Test-InProgressFreshInstall -State $installerState) {
+        Install-MailSiteFresh -ResumeState $installerState
+        return
+    }
+    if (Test-LegacyFreshInstallMarker -State $installerState) {
+        if (Test-LegacyFreshInstallComplete -State $installerState) {
+            Write-InstallerMessage "Detected a completed fresh install written by the previous installer-state format."
+        } else {
+            $installedServices = @(Get-InstalledMailSiteServiceNames)
+            if (-not (Test-Path -LiteralPath $MailSiteKey32) -and $installedServices.Count -eq 0) {
+                Write-InstallerMessage "Detected an interrupted fresh install from the previous installer version. Restarting fresh setup and prompting for the details that were not stored." -Level "WARN"
+                Install-MailSiteFresh -LegacyRecoveryState $installerState
+                return
+            }
+            throw "A previous-version fresh install is incomplete and cannot be resumed safely because it did not record the domain or service account. Run uninstall-mailsite.ps1 -InstallDir `"$InstallDir`" to remove the owned partial install, then run this installer again."
+        }
+    }
 
     $installedState = Get-InstalledMailSite11State -RootDirectory $InstallDir
     $installedVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $installedState
@@ -2405,14 +2914,20 @@ function Install-MailSite {
             $legacy = Assert-MailSite10
             Write-InstallerMessage "Detected MailSite $($legacy.RegistryVersion) using $($legacy.ConnectorName)."
         } catch {
-            # A license rejection is a definite block, not evidence that
-            # MailSite 10 is gone; re-throw it so the upgrade stops with the
-            # real message instead of misreporting an absent MailSite 10.
-            if (([string]$_.Exception.Message).StartsWith($LicenseRejectedMessagePrefix)) {
+            # A rejection or unavailable website is a license-validation
+            # block, not evidence that MailSite 10 is gone; re-throw it so the
+            # upgrade stops with the real message.
+            if (([string]$_.Exception.Message).StartsWith($LicenseRejectedMessagePrefix) -or
+                ([string]$_.Exception.Message).StartsWith($LicenseUnavailableMessagePrefix)) {
                 throw
             }
             $legacy = $null
             Write-InstallerMessage "MailSite 10 is no longer present; performing a MailSite 11 binary upgrade. Rollback to MailSite 10 will not be available." -Level "WARN"
+            $installedLicenseKey = Get-RegistryString -Path $MailSiteKey32 -Name "License"
+            Assert-MailSiteLicenseValidatedOnline `
+                -LicenseKey $installedLicenseKey `
+                -AllowedProductMajors @(10, 11) `
+                -BlankLicenseWarning "The existing MailSite 11 installation has no license key on record. Services will continue only under the legacy blank-license compatibility exception."
         }
     }
 
@@ -2487,6 +3002,7 @@ function Install-MailSite {
 
         $existingState = Get-ExistingInstallerState
         $state = @{
+            StateVersion = $InstallerStateVersion
             InstalledAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
             InstallDir11 = $InstallDir
             TargetVersion = $targetVersion
@@ -2494,6 +3010,10 @@ function Install-MailSite {
             # deleting the services instead of reverting to a MailSite 10 that
             # never existed on this machine.
             FreshInstall = ($null -ne $existingState -and [bool]$existingState.FreshInstall)
+            InstallStatus = $FreshInstallStatusComplete
+            DomainName = ([string](Get-InstallerStatePropertyValue -State $existingState -PropertyName "DomainName"))
+            ServiceAccountName = ([string](Get-InstallerStatePropertyValue -State $existingState -PropertyName "ServiceAccountName"))
+            ProductRegistryExistedBefore = (Get-InstallerStatePropertyValue -State $existingState -PropertyName "ProductRegistryExistedBefore")
             PreviousImagePath = Copy-StateMap -State $existingState -PropertyName "PreviousImagePath"
             PreviousDescription = Copy-StateMap -State $existingState -PropertyName "PreviousDescription"
             WasRunning = @{}
@@ -2591,11 +3111,13 @@ function Install-MailSite {
     }
 }
 
-try {
-    Install-MailSite
-} catch {
-    Write-InstallerFailure $_.Exception.Message
-    if ($PSCommandPath) {
-        exit 1
+if ($MyInvocation.InvocationName -ne ".") {
+    try {
+        Install-MailSite
+    } catch {
+        Write-InstallerFailure $_.Exception.Message
+        if ($PSCommandPath) {
+            exit 1
+        }
     }
 }
