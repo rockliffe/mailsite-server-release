@@ -22,15 +22,83 @@ $DesktopApps = @(
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
-$InstallMarkerName = ".mailsite11-install.json"
+$InstallMarkerName = "install.json"
+$InstallerStateVersion = 2
+$FreshInstallStatusInProgress = "InProgress"
+$FreshInstallStatusComplete = "Complete"
 $script:LogPath = $null
+
+function Get-InstallMarkerPath {
+    param([string]$RootDirectory)
+
+    return Join-Path (Join-Path $RootDirectory "Log") $InstallMarkerName
+}
+
+function Get-NormalizedMailSitePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return ""
+    }
+    $fullPath = [IO.Path]::GetFullPath($Path.Trim())
+    return $fullPath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar).ToLowerInvariant()
+}
+
+function Test-MailSitePathEqual {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    return (Get-NormalizedMailSitePath -Path $Left) -ceq (Get-NormalizedMailSitePath -Path $Right)
+}
+
+function Get-UninstallerStateStatus {
+    param([object]$State)
+
+    Assert-UninstallerStateVersion -State $State
+    $property = $State.PSObject.Properties["InstallStatus"]
+    if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+        return $FreshInstallStatusComplete
+    }
+    $status = [string]$property.Value
+    if ($status -ne $FreshInstallStatusInProgress -and $status -ne $FreshInstallStatusComplete) {
+        throw "Installer state contains unsupported InstallStatus '$status'."
+    }
+    return $status
+}
+
+function Assert-UninstallerStateVersion {
+    param([object]$State)
+
+    $versionProperty = $State.PSObject.Properties["StateVersion"]
+    if ($null -ne $versionProperty -and [int]$versionProperty.Value -ne $InstallerStateVersion) {
+        throw "Installer state uses unsupported StateVersion '$($versionProperty.Value)'."
+    }
+}
+
+function Resolve-UninstallerStateDirectory {
+    param(
+        [object]$State,
+        [string]$MarkerRoot
+    )
+
+    $stateDirectory = [string]$State.InstallDir11
+    if ([string]::IsNullOrWhiteSpace($stateDirectory)) {
+        return $MarkerRoot
+    }
+    if (-not (Test-MailSitePathEqual -Left $stateDirectory -Right $MarkerRoot)) {
+        throw "Installer state at '$MarkerRoot' belongs to '$stateDirectory'. Rerun uninstall with the original -InstallDir; no changes were made."
+    }
+    return $stateDirectory
+}
 
 function Initialize-UninstallLog {
     param([string]$RootDirectory)
 
     $logDirectory = Join-Path $RootDirectory "Log"
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-    $script:LogPath = Join-Path $logDirectory "install-mailsite.log"
+    $script:LogPath = Join-Path $logDirectory "install.log"
     Write-UninstallerMessage "MailSite uninstaller started."
 }
 
@@ -125,8 +193,28 @@ function Get-ServiceImagePathExecutable {
             return $match.Groups[1].Value
         }
     }
+    $match = [regex]::Match($trimmed, '^(.+?\.exe)(?:\s|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+    return $trimmed
+}
 
-    return ($trimmed -split '\s+', 2)[0]
+function Assert-FreshInstallServiceOwnership {
+    param([string]$InstalledDirectory)
+
+    foreach ($service in $Services) {
+        if ($null -eq (Get-Service -Name $service.Name -ErrorAction SilentlyContinue)) {
+            continue
+        }
+        $servicePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
+        $imagePath = (Get-ItemProperty -LiteralPath $servicePath -Name ImagePath).ImagePath
+        $actualExecutable = Get-ServiceImagePathExecutable -ImagePath $imagePath
+        $expectedExecutable = Join-Path $InstalledDirectory $service.File
+        if (-not (Test-MailSitePathEqual -Left $actualExecutable -Right $expectedExecutable)) {
+            throw "Refusing fresh uninstall because service $($service.Name) points to '$actualExecutable', not the owned path '$expectedExecutable'. No changes were made."
+        }
+    }
 }
 
 function Test-MailSiteLegacyService {
@@ -309,14 +397,71 @@ function Remove-MailSiteFirewallRules {
     }
 }
 
+function Assert-FreshInstallProductRegistryOwnership {
+    param(
+        [object]$State,
+        [string]$InstalledDirectory
+    )
+
+    $freshProperty = $State.PSObject.Properties["FreshInstall"]
+    if ($null -eq $freshProperty -or -not [bool]$freshProperty.Value) {
+        throw "Refusing to remove the MailSite product registry for a non-fresh installer state."
+    }
+    $preexistingProperty = $State.PSObject.Properties["ProductRegistryExistedBefore"]
+    if ($null -ne $preexistingProperty -and [bool]$preexistingProperty.Value) {
+        throw "Refusing to remove the MailSite product registry because the installer marker says it predated the fresh-install attempt."
+    }
+    if (-not (Test-Path -LiteralPath $MailSiteKey32)) {
+        return
+    }
+
+    $registry = Get-ItemProperty -LiteralPath $MailSiteKey32
+    $majorProperty = $registry.PSObject.Properties["ServerMajorVersion"]
+    $installDirectoryProperty = $registry.PSObject.Properties["InstallDir11"]
+    $status = Get-UninstallerStateStatus -State $State
+
+    if ($null -ne $majorProperty -and [int]$majorProperty.Value -ne 11) {
+        throw "Refusing to remove $MailSiteKey32 because ServerMajorVersion is '$($majorProperty.Value)', not 11."
+    }
+    if ($null -ne $installDirectoryProperty -and
+        -not [string]::IsNullOrWhiteSpace([string]$installDirectoryProperty.Value) -and
+        -not (Test-MailSitePathEqual -Left ([string]$installDirectoryProperty.Value) -Right $InstalledDirectory)) {
+        throw "Refusing to remove $MailSiteKey32 because InstallDir11 points to '$($installDirectoryProperty.Value)', not '$InstalledDirectory'."
+    }
+    if ($status -eq $FreshInstallStatusComplete) {
+        if ($null -eq $majorProperty -or $null -eq $installDirectoryProperty -or
+            [string]::IsNullOrWhiteSpace([string]$installDirectoryProperty.Value)) {
+            throw "Refusing to remove $MailSiteKey32 because it does not contain both ServerMajorVersion=11 and InstallDir11 ownership values. Remove or repair this ambiguous registry key manually after confirming it is not a MailSite 10 installation."
+        }
+    }
+}
+
+function Remove-FreshInstallProductRegistry {
+    param(
+        [object]$State,
+        [string]$InstalledDirectory
+    )
+
+    Assert-FreshInstallProductRegistryOwnership -State $State -InstalledDirectory $InstalledDirectory
+    if (-not (Test-Path -LiteralPath $MailSiteKey32)) {
+        Write-UninstallerMessage "MailSite product registry key is already absent."
+        return
+    }
+
+    Write-UninstallerMessage "Removing fresh MailSite 11 configuration from $MailSiteKey32..."
+    Remove-Item -LiteralPath $MailSiteKey32 -Recurse -Force
+}
+
 function Load-InstallerState {
-    $markerPath = Join-Path $InstallDir $InstallMarkerName
+    $markerPath = Get-InstallMarkerPath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $markerPath)) {
         throw "MailSite 11 installer state was not found at $markerPath. Cannot safely uninstall."
     }
 
     $json = Get-Content -LiteralPath $markerPath -Raw
-    return $json | ConvertFrom-Json
+    $state = $json | ConvertFrom-Json
+    Assert-UninstallerStateVersion -State $state
+    return $state
 }
 
 function Confirm-MailSiteUninstall {
@@ -343,6 +488,7 @@ function Confirm-MailSiteUninstall {
     if ($FreshInstall) {
         # This MailSite 11 was a fresh install; there is no MailSite 10 to revert to.
         Write-Host "  - Remove MailSite services"
+        Write-Host "  - Remove MailSite registry configuration and default-domain accounts"
     } else {
         Write-Host "  - Restore service paths to MailSite 10"
     }
@@ -356,13 +502,11 @@ function Confirm-MailSiteUninstall {
 
 function Uninstall-MailSite {
     Assert-Administrator
-    Initialize-UninstallLog -RootDirectory $InstallDir
-
     $state = Load-InstallerState
-    $installedDir = $state.InstallDir11
-    if ([string]::IsNullOrWhiteSpace($installedDir)) {
-        $installedDir = $InstallDir
-    }
+    # The marker may be copied or stale. Never let a marker loaded from one
+    # command-line root redirect an elevated uninstall to another directory.
+    $installedDir = Resolve-UninstallerStateDirectory -State $state -MarkerRoot $InstallDir
+    Initialize-UninstallLog -RootDirectory $installedDir
 
     # MailSite 11 installs written by the fresh-install flow record FreshInstall in
     # the marker: there is no MailSite 10 to revert to, so the services created by
@@ -371,6 +515,13 @@ function Uninstall-MailSite {
     $freshInstallProperty = $state.PSObject.Properties["FreshInstall"]
     if ($null -ne $freshInstallProperty) {
         $freshInstall = [bool]$freshInstallProperty.Value
+    }
+
+    # Prove registry ownership before stopping/removing any service. A stale or
+    # contradictory marker must leave the existing installation untouched.
+    if ($freshInstall) {
+        Assert-FreshInstallProductRegistryOwnership -State $state -InstalledDirectory $installedDir
+        Assert-FreshInstallServiceOwnership -InstalledDirectory $installedDir
     }
 
     # Resolve where each service reverts to (its MailSite 10 binary) before making
@@ -439,7 +590,11 @@ function Uninstall-MailSite {
 
     Remove-MailSiteFirewallRules
 
-    $markerPath = Join-Path $installedDir $InstallMarkerName
+    if ($freshInstall) {
+        Remove-FreshInstallProductRegistry -State $state -InstalledDirectory $installedDir
+    }
+
+    $markerPath = Get-InstallMarkerPath -RootDirectory $installedDir
     if ((Test-Path -LiteralPath $markerPath) -and (Test-Path -LiteralPath $installedDir)) {
         Write-UninstallerMessage "Removing MailSite 11 files from $installedDir..."
         Remove-Item -Path $installedDir -Recurse -Force
@@ -452,11 +607,13 @@ function Uninstall-MailSite {
     }
 }
 
-try {
-    Uninstall-MailSite
-} catch {
-    Write-UninstallerFailure $_.Exception.Message
-    if ($PSCommandPath) {
-        exit 1
+if ($MyInvocation.InvocationName -ne ".") {
+    try {
+        Uninstall-MailSite
+    } catch {
+        Write-UninstallerFailure $_.Exception.Message
+        if ($PSCommandPath) {
+            exit 1
+        }
     }
 }
