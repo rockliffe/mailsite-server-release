@@ -5,7 +5,9 @@ param(
     [string]$InstallDir = (Join-Path $env:ProgramFiles "MailSite"),
     [string]$PackagePath,
     [string]$PackageUrl = "https://github.com/rockliffe/mailsite-server-release/releases/latest/download/MailSite.zip",
-    [string]$LicenseApiBaseUrl
+    [string]$LicenseApiBaseUrl,
+    [switch]$GrantServiceControl,
+    [switch]$SkipServiceControlGrant
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +34,8 @@ $DesktopApps = @(
 )
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
+$InstallDataDirectoryName = "Install"
+$LegacyInstallDataDirectoryName = "Log"
 $InstallMarkerName = "install.json"
 $InstallerStateVersion = 2
 $FreshInstallStatusInProgress = "InProgress"
@@ -43,7 +47,8 @@ $TargetMajorVersion = "11"
 # DEFAULT_LICENSE_API_BASE_URL) before the first production release.
 $DefaultLicenseApiBaseUrl = "https://mailsite.dev"
 $FreshTrialLicenseRequest = "__MAILSITE_ONLINE_TRIAL__"
-$LicenseValidationCacheName = ".mailsite-license-validation.json"
+$LicenseValidationCacheName = "license.json"
+$LegacyLicenseValidationCacheName = ".mailsite-license-validation.json"
 # Marks authoritative license failures from Assert-MailSite10 so upgrade paths
 # can tell them apart from "MailSite 10 is not present" failures.
 $LicenseRejectedMessagePrefix = "The existing MailSite license was rejected by the license service:"
@@ -78,9 +83,9 @@ function Format-InstallerConsoleMessage {
 function Initialize-InstallLog {
     param([string]$RootDirectory)
 
-    $logDirectory = Join-Path $RootDirectory "Log"
-    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
-    $script:LogPath = Join-Path $logDirectory "install.log"
+    $installDataDirectory = Join-Path $RootDirectory $InstallDataDirectoryName
+    New-Item -ItemType Directory -Path $installDataDirectory -Force | Out-Null
+    $script:LogPath = Join-Path $installDataDirectory "install.log"
     Write-InstallerMessage "MailSite installer started."
 }
 
@@ -354,6 +359,135 @@ function Write-MailSiteServiceAccountMismatchWarning {
 
     $summary = Format-MailSiteServiceAccountGroups -Audit $Audit
     Write-InstallerMessage "MailSite Windows services are configured with different Log On As accounts: $summary. Configure all MailSite Windows services to use the same account, then restart them." -Level "WARN"
+}
+
+function Assert-MailSiteServiceControlGrantOptions {
+    if ($GrantServiceControl -and $SkipServiceControlGrant) {
+        throw "-GrantServiceControl and -SkipServiceControlGrant cannot be used together."
+    }
+}
+
+function Get-MailSiteServiceControlRepairCommand {
+    param([string]$HttpmaPath)
+
+    # Single-quote the path so a copy/pasted command cannot expand `$`,
+    # backticks, or subexpressions in a caller-selected install directory.
+    $quotedPath = $HttpmaPath.Replace("'", "''")
+    return "& '$quotedPath' grant-service-control"
+}
+
+function Write-MailSiteServiceControlRepairWarning {
+    param(
+        [string]$HttpmaPath,
+        [string]$Reason
+    )
+
+    $command = Get-MailSiteServiceControlRepairCommand -HttpmaPath $HttpmaPath
+    Write-InstallerMessage "$Reason Run $command from an elevated PowerShell prompt to repair the permissions." -Level "WARN"
+}
+
+function Invoke-MailSiteServiceControlPermissionRepair {
+    param([string]$HttpmaPath)
+
+    # This audit is deliberately non-fatal. Permission inspection or repair
+    # must never roll back an otherwise successful binary/service update.
+    try {
+        $checkResult = Invoke-MailSiteExecutable `
+            -FilePath $HttpmaPath `
+            -ArgumentList @("grant-service-control", "--check", "--json")
+        if ($checkResult.ExitCode -ne 0) {
+            $detail = (@($checkResult.Output) -join [Environment]::NewLine).Trim()
+            $reason = "Could not audit MailSite service-control permissions."
+            if (-not [string]::IsNullOrWhiteSpace($detail)) {
+                $reason += " $detail"
+            }
+            Write-MailSiteServiceControlRepairWarning -HttpmaPath $HttpmaPath -Reason $reason
+            return
+        }
+
+        $json = (@($checkResult.Output) -join [Environment]::NewLine).Trim()
+        $audit = $json | ConvertFrom-Json -ErrorAction Stop
+        $properties = @($audit.PSObject.Properties.Name)
+        $requiredProperties = @("schemaVersion", "account", "complete", "grantRequired", "services", "registryKeys")
+        foreach ($property in $requiredProperties) {
+            if ($properties -notcontains $property) {
+                throw "Permission audit JSON is missing '$property'."
+            }
+        }
+        if ([int]$audit.schemaVersion -ne 1) {
+            throw "Unsupported permission audit schema version '$($audit.schemaVersion)'."
+        }
+        if ($audit.complete -isnot [bool] -or $audit.grantRequired -isnot [bool]) {
+            throw "Permission audit JSON has invalid completion fields."
+        }
+        if (-not [bool]$audit.complete) {
+            Write-MailSiteServiceControlRepairWarning `
+                -HttpmaPath $HttpmaPath `
+                -Reason "The MailSite service-control permission audit was incomplete."
+            return
+        }
+        if (-not [bool]$audit.grantRequired) {
+            Write-InstallerMessage "MailSite service-control and configuration permissions are already sufficient for $($audit.account)."
+            return
+        }
+
+        $missingServices = @(
+            $audit.services |
+                Where-Object { $_.status -eq "needs_grant" } |
+                ForEach-Object { [string]$_.name }
+        )
+        $missingRegistryKeys = @(
+            $audit.registryKeys |
+                Where-Object { $_.status -eq "needs_grant" } |
+                ForEach-Object { [string]$_.path }
+        )
+        $missingSummary = @()
+        if ($missingServices.Count -gt 0) {
+            $missingSummary += "services: $($missingServices -join ', ')"
+        }
+        if ($missingRegistryKeys.Count -gt 0) {
+            $missingSummary += "$($missingRegistryKeys.Count) configuration registry key(s)"
+        }
+        $detail = if ($missingSummary.Count -gt 0) { " ($($missingSummary -join '; '))" } else { "" }
+
+        if ($SkipServiceControlGrant) {
+            Write-MailSiteServiceControlRepairWarning `
+                -HttpmaPath $HttpmaPath `
+                -Reason "Required permissions for $($audit.account)$detail were not changed because -SkipServiceControlGrant was specified."
+            return
+        }
+
+        $applyGrant = [bool]$GrantServiceControl
+        if (-not $applyGrant) {
+            $prompt = "HTTPMA runs as $($audit.account), but that account is missing required MailSite permissions$detail. Grant them now? This does not change any service Log On As setting."
+            $applyGrant = Read-YesNo -Prompt $prompt -DefaultYes $true
+        }
+        if (-not $applyGrant) {
+            Write-MailSiteServiceControlRepairWarning `
+                -HttpmaPath $HttpmaPath `
+                -Reason "Required permissions for $($audit.account)$detail were not granted."
+            return
+        }
+
+        Write-InstallerMessage "Granting MailSite service-control and configuration permissions to $($audit.account)..."
+        $grantResult = Invoke-MailSiteExecutable `
+            -FilePath $HttpmaPath `
+            -ArgumentList @("grant-service-control")
+        if ($grantResult.ExitCode -ne 0) {
+            $grantDetail = (@($grantResult.Output) -join [Environment]::NewLine).Trim()
+            $reason = "Could not grant all required permissions to $($audit.account)."
+            if (-not [string]::IsNullOrWhiteSpace($grantDetail)) {
+                $reason += " $grantDetail"
+            }
+            Write-MailSiteServiceControlRepairWarning -HttpmaPath $HttpmaPath -Reason $reason
+            return
+        }
+        Write-InstallerMessage "MailSite service-control and configuration permissions were granted to $($audit.account)."
+    } catch {
+        Write-MailSiteServiceControlRepairWarning `
+            -HttpmaPath $HttpmaPath `
+            -Reason "Could not audit or repair MailSite service-control permissions: $($_.Exception.Message)"
+    }
 }
 
 function Set-ServiceImagePath {
@@ -899,6 +1033,34 @@ function Get-MailSiteLicenseApiResponseMessage {
     return "The license service did not return a usable response."
 }
 
+function Get-LicenseValidationCachePath {
+    param([string]$RootDirectory)
+
+    return Join-Path (Join-Path $RootDirectory $InstallDataDirectoryName) $LicenseValidationCacheName
+}
+
+function Get-LegacyLicenseValidationCachePath {
+    param([string]$RootDirectory)
+
+    return Join-Path (Join-Path $RootDirectory $LegacyInstallDataDirectoryName) $LegacyLicenseValidationCacheName
+}
+
+function Resolve-LicenseValidationCachePath {
+    param([string]$RootDirectory)
+
+    $primaryPath = Get-LicenseValidationCachePath -RootDirectory $RootDirectory
+    if (Test-Path -LiteralPath $primaryPath -PathType Leaf) {
+        return $primaryPath
+    }
+
+    $legacyPath = Get-LegacyLicenseValidationCachePath -RootDirectory $RootDirectory
+    if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
+        return $legacyPath
+    }
+
+    return $primaryPath
+}
+
 function Save-MailSiteLicenseValidationCache {
     param(
         [string]$InstallDirectory,
@@ -910,9 +1072,9 @@ function Save-MailSiteLicenseValidationCache {
     }
 
     try {
-        # The cache lives in Log because the MailSite services run as a
-        # non-admin account with write access to Log but not the install root.
-        $cacheDirectory = Join-Path $InstallDirectory "Log"
+        # Install is a fixed product-data directory whose ACL is repaired for
+        # every configured MailSite service identity during install/reinstall.
+        $cacheDirectory = Join-Path $InstallDirectory $InstallDataDirectoryName
         New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
         $cache = [ordered]@{
             CachedAtUtc = [DateTimeOffset]::UtcNow.ToString("o")
@@ -922,7 +1084,7 @@ function Save-MailSiteLicenseValidationCache {
             Validation = $ValidationBody.validation
             ValidationToken = $ValidationBody.validationToken
         }
-        $path = Join-Path $cacheDirectory $LicenseValidationCacheName
+        $path = Get-LicenseValidationCachePath -RootDirectory $InstallDirectory
         $cache | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
         Write-InstallerMessage "Cached signed license validation through $($ValidationBody.validation.graceUntil)."
     } catch {
@@ -1461,7 +1623,29 @@ function Get-MailSiteComponentVersionSummary {
 function Get-InstallMarkerPath {
     param([string]$RootDirectory)
 
-    return Join-Path (Join-Path $RootDirectory "Log") $InstallMarkerName
+    return Join-Path (Join-Path $RootDirectory $InstallDataDirectoryName) $InstallMarkerName
+}
+
+function Get-LegacyInstallMarkerPath {
+    param([string]$RootDirectory)
+
+    return Join-Path (Join-Path $RootDirectory $LegacyInstallDataDirectoryName) $InstallMarkerName
+}
+
+function Resolve-InstallMarkerPath {
+    param([string]$RootDirectory)
+
+    $primaryPath = Get-InstallMarkerPath -RootDirectory $RootDirectory
+    if (Test-Path -LiteralPath $primaryPath -PathType Leaf) {
+        return $primaryPath
+    }
+
+    $legacyPath = Get-LegacyInstallMarkerPath -RootDirectory $RootDirectory
+    if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
+        return $legacyPath
+    }
+
+    return $primaryPath
 }
 
 function Save-InstallerState {
@@ -1492,7 +1676,7 @@ function Save-InstallerState {
 }
 
 function Get-ExistingInstallerState {
-    $markerPath = Get-InstallMarkerPath -RootDirectory $InstallDir
+    $markerPath = Resolve-InstallMarkerPath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $markerPath)) {
         return $null
     }
@@ -2242,9 +2426,10 @@ function Resolve-FreshInstallLicenseKey {
 }
 
 function Get-FreshInstallLicenseKeyFromCache {
-    $cachePath = Join-Path (Join-Path $InstallDir "Log") $LicenseValidationCacheName
+    $cachePath = Resolve-LicenseValidationCachePath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
-        throw "The interrupted fresh install has no signed license cache at $cachePath. Start over with uninstall-mailsite.ps1."
+        $legacyPath = Get-LegacyLicenseValidationCachePath -RootDirectory $InstallDir
+        throw "The interrupted fresh install has no signed license cache at $cachePath or $legacyPath. Start over with uninstall-mailsite.ps1."
     }
     try {
         $cache = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
@@ -2615,6 +2800,107 @@ function Set-FreshInstallDirectoryAcl {
     }
 }
 
+function ConvertTo-MailSiteFileAclSid {
+    param([string]$AccountName)
+
+    $normalized = Normalize-ServiceLogOnAccount -AccountName $AccountName
+    switch ($normalized) {
+        "nt authority\system" { return "*S-1-5-18" }
+        "nt authority\localservice" { return "*S-1-5-19" }
+        "nt authority\networkservice" { return "*S-1-5-20" }
+    }
+
+    try {
+        $account = [Security.Principal.NTAccount]::new($normalized)
+        $sid = $account.Translate([Security.Principal.SecurityIdentifier])
+        return "*$($sid.Value)"
+    } catch {
+        throw "Could not resolve the MailSite service account '$AccountName' to a Windows SID: $($_.Exception.Message)"
+    }
+}
+
+function Set-MailSiteInstallDataDirectoryAcl {
+    param(
+        [string]$RootDirectory,
+        [hashtable]$Audit
+    )
+
+    $directory = Join-Path $RootDirectory $InstallDataDirectoryName
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    if ($null -eq $Audit) {
+        $Audit = Get-MailSiteServiceAccountAudit
+    }
+
+    $aclIdentities = [ordered]@{}
+    if ($null -ne $Audit.Groups) {
+        foreach ($normalizedAccount in @($Audit.Groups.Keys)) {
+            # LocalSystem already has full control through the standard Program
+            # Files ACL (and the fresh-install root grant). Other built-in and
+            # custom identities need an explicit, inheritable Modify grant.
+            if ([string]$normalizedAccount -eq "nt authority\system") {
+                continue
+            }
+            $group = $Audit.Groups[$normalizedAccount]
+            $sid = ConvertTo-MailSiteFileAclSid -AccountName ([string]$normalizedAccount)
+            if (-not $aclIdentities.Contains($sid)) {
+                $aclIdentities[$sid] = [string]$group.Display
+            }
+        }
+    }
+
+    if ($aclIdentities.Count -eq 0) {
+        Write-InstallerMessage "MailSite install-data permissions require no additional filesystem grants."
+        return
+    }
+
+    $accounts = @($aclIdentities.Values)
+    $arguments = @($directory, "/grant")
+    foreach ($sid in $aclIdentities.Keys) {
+        $arguments += "${sid}:(OI)(CI)M"
+    }
+    # Apply recursively because install.log, install.json, and license.json may
+    # have been created by this elevated installer before the service identity
+    # was audited. Runtime cache replacement requires create/delete/rename.
+    $arguments += @("/T", "/C", "/Q")
+
+    Write-InstallerMessage "Granting Modify access on $directory to $($accounts -join ', ')..."
+    $result = Invoke-MailSiteExecutable -FilePath "icacls.exe" -ArgumentList $arguments
+    if ($result.ExitCode -ne 0) {
+        $detail = (@($result.Output) -join [Environment]::NewLine).Trim()
+        throw "Could not grant MailSite services write access to ${directory}: icacls.exe exited with code $($result.ExitCode). $detail"
+    }
+}
+
+function Normalize-PackageReleaseNotes {
+    param(
+        [string]$PackageRoot,
+        [string]$RootDirectory
+    )
+
+    $packagePrimaryPath = Join-Path (Join-Path $PackageRoot $InstallDataDirectoryName) "release-notes.html"
+    $packageLegacyPath = Join-Path $PackageRoot "mailsite-release-notes.html"
+    $destinationDirectory = Join-Path $RootDirectory $InstallDataDirectoryName
+    $destinationPrimaryPath = Join-Path $destinationDirectory "release-notes.html"
+    $destinationLegacyPath = Join-Path $RootDirectory "mailsite-release-notes.html"
+
+    if (Test-Path -LiteralPath $packagePrimaryPath -PathType Leaf) {
+        # The recursive package copy already installed the primary file. Remove
+        # only a stale root-level file left by an earlier build.
+        Remove-Item -LiteralPath $destinationLegacyPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    if (Test-Path -LiteralPath $packageLegacyPath -PathType Leaf) {
+        # Explicit older packages and supported downgrades still carry the old
+        # root filename. Normalize their own release notes instead of deleting
+        # them or retaining a newer package's stale primary file.
+        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+        Copy-Item -LiteralPath $packageLegacyPath -Destination $destinationPrimaryPath -Force
+        Remove-Item -LiteralPath $destinationLegacyPath -Force -ErrorAction SilentlyContinue
+        Write-InstallerMessage "Moved package release notes to $destinationPrimaryPath."
+    }
+}
+
 function Assert-FreshInstallExecutablesPresent {
     foreach ($service in $Services) {
         $executable = Join-Path $InstallDir $service.File
@@ -2788,6 +3074,7 @@ function Install-MailSiteFresh {
 
         Write-InstallerMessage "Installing MailSite $targetVersion to $InstallDir..."
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
+        Normalize-PackageReleaseNotes -PackageRoot $packageRoot -RootDirectory $InstallDir
         New-MailSiteDesktopShortcuts -RootDirectory $InstallDir
 
         Invoke-MailSiteFreshSetup `
@@ -2811,7 +3098,10 @@ function Install-MailSiteFresh {
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
-        Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
+        $serviceAccountAudit = Get-MailSiteServiceAccountAudit
+        Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
+        Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
+        [void](Invoke-MailSiteServiceControlPermissionRepair -HttpmaPath (Join-Path $InstallDir "httpma.exe"))
 
         $startFailures = @()
         foreach ($service in $Services) {
@@ -2877,9 +3167,16 @@ function Install-MailSiteFresh {
 }
 
 function Install-MailSite {
+    Assert-MailSiteServiceControlGrantOptions
     Assert-Administrator
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Initialize-InstallLog -RootDirectory $InstallDir
+    # Repair the currently configured service identities before any online
+    # license check creates the new primary cache. This still runs again after
+    # service registration so newly added or reinstalled services are covered.
+    Set-MailSiteInstallDataDirectoryAcl `
+        -RootDirectory $InstallDir `
+        -Audit (Get-MailSiteServiceAccountAudit)
 
     # Explicit state takes precedence over binary/registry heuristics. A fresh
     # attempt may have copied every executable and written part of the registry
@@ -2972,13 +3269,19 @@ function Install-MailSite {
     if ((Test-ExactMailSiteVersion -Version $requestedVersion) -and (Test-ExactMailSiteVersion -Version $installedVersion)) {
         $requestedComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
         if ($requestedComparison -eq 0 -and -not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
-            Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
-            Write-InstallerMessage "MailSite $requestedVersion is already installed. No changes were made."
+            $serviceAccountAudit = Get-MailSiteServiceAccountAudit
+            Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
+            Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
+            [void](Invoke-MailSiteServiceControlPermissionRepair -HttpmaPath (Join-Path $InstallDir "httpma.exe"))
+            Write-InstallerMessage "MailSite $requestedVersion is already installed. No package changes were made."
             return
         }
         if ($requestedComparison -lt 0 -and -not $installRequest.AllowDowngrade) {
-            Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
-            Write-InstallerMessage "MailSite $installedDisplayVersion is already installed, which includes a component newer than MailSite $requestedVersion. No changes were made." -Level "WARN"
+            $serviceAccountAudit = Get-MailSiteServiceAccountAudit
+            Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
+            Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
+            [void](Invoke-MailSiteServiceControlPermissionRepair -HttpmaPath (Join-Path $InstallDir "httpma.exe"))
+            Write-InstallerMessage "MailSite $installedDisplayVersion is already installed, which includes a component newer than MailSite $requestedVersion. No package changes were made." -Level "WARN"
             return
         }
         if ($requestedComparison -lt 0) {
@@ -3009,8 +3312,11 @@ function Install-MailSite {
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
             $targetComparison = Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion
             if ($targetComparison -eq 0 -and -not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
-                Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
-                Write-InstallerMessage "MailSite $targetVersion is already installed. No changes were made."
+                $serviceAccountAudit = Get-MailSiteServiceAccountAudit
+                Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
+                Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
+                [void](Invoke-MailSiteServiceControlPermissionRepair -HttpmaPath (Join-Path $InstallDir "httpma.exe"))
+                Write-InstallerMessage "MailSite $targetVersion is already installed. No package changes were made."
                 Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
                 return
             }
@@ -3073,6 +3379,7 @@ function Install-MailSite {
 
         Remove-InstalledExpressProDist -PackageRoot $packageRoot -DestinationRoot $InstallDir
         Copy-Item -Path (Join-Path $packageRoot "*") -Destination $InstallDir -Recurse -Force
+        Normalize-PackageReleaseNotes -PackageRoot $packageRoot -RootDirectory $InstallDir
         New-MailSiteDesktopShortcuts -RootDirectory $InstallDir
 
         Save-InstallerState -State $state
@@ -3092,7 +3399,10 @@ function Install-MailSite {
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
-        Write-MailSiteServiceAccountMismatchWarning -Audit (Get-MailSiteServiceAccountAudit)
+        $serviceAccountAudit = Get-MailSiteServiceAccountAudit
+        Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
+        Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
+        [void](Invoke-MailSiteServiceControlPermissionRepair -HttpmaPath (Join-Path $InstallDir "httpma.exe"))
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
 
