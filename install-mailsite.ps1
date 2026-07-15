@@ -35,7 +35,6 @@ $DesktopApps = @(
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallDataDirectoryName = "Install"
-$LegacyInstallDataDirectoryName = "Log"
 $InstallMarkerName = "install.json"
 $InstallerStateVersion = 2
 $FreshInstallStatusInProgress = "InProgress"
@@ -48,7 +47,6 @@ $TargetMajorVersion = "11"
 $DefaultLicenseApiBaseUrl = "https://mailsite.dev"
 $FreshTrialLicenseRequest = "__MAILSITE_ONLINE_TRIAL__"
 $LicenseValidationCacheName = "license.json"
-$LegacyLicenseValidationCacheName = ".mailsite-license-validation.json"
 # Marks authoritative license failures from Assert-MailSite10 so upgrade paths
 # can tell them apart from "MailSite 10 is not present" failures.
 $LicenseRejectedMessagePrefix = "The existing MailSite license was rejected by the license service:"
@@ -1039,28 +1037,6 @@ function Get-LicenseValidationCachePath {
     return Join-Path (Join-Path $RootDirectory $InstallDataDirectoryName) $LicenseValidationCacheName
 }
 
-function Get-LegacyLicenseValidationCachePath {
-    param([string]$RootDirectory)
-
-    return Join-Path (Join-Path $RootDirectory $LegacyInstallDataDirectoryName) $LegacyLicenseValidationCacheName
-}
-
-function Resolve-LicenseValidationCachePath {
-    param([string]$RootDirectory)
-
-    $primaryPath = Get-LicenseValidationCachePath -RootDirectory $RootDirectory
-    if (Test-Path -LiteralPath $primaryPath -PathType Leaf) {
-        return $primaryPath
-    }
-
-    $legacyPath = Get-LegacyLicenseValidationCachePath -RootDirectory $RootDirectory
-    if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
-        return $legacyPath
-    }
-
-    return $primaryPath
-}
-
 function Save-MailSiteLicenseValidationCache {
     param(
         [string]$InstallDirectory,
@@ -1626,28 +1602,6 @@ function Get-InstallMarkerPath {
     return Join-Path (Join-Path $RootDirectory $InstallDataDirectoryName) $InstallMarkerName
 }
 
-function Get-LegacyInstallMarkerPath {
-    param([string]$RootDirectory)
-
-    return Join-Path (Join-Path $RootDirectory $LegacyInstallDataDirectoryName) $InstallMarkerName
-}
-
-function Resolve-InstallMarkerPath {
-    param([string]$RootDirectory)
-
-    $primaryPath = Get-InstallMarkerPath -RootDirectory $RootDirectory
-    if (Test-Path -LiteralPath $primaryPath -PathType Leaf) {
-        return $primaryPath
-    }
-
-    $legacyPath = Get-LegacyInstallMarkerPath -RootDirectory $RootDirectory
-    if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
-        return $legacyPath
-    }
-
-    return $primaryPath
-}
-
 function Save-InstallerState {
     param([object]$State)
 
@@ -1676,7 +1630,7 @@ function Save-InstallerState {
 }
 
 function Get-ExistingInstallerState {
-    $markerPath = Resolve-InstallMarkerPath -RootDirectory $InstallDir
+    $markerPath = Get-InstallMarkerPath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $markerPath)) {
         return $null
     }
@@ -2426,10 +2380,9 @@ function Resolve-FreshInstallLicenseKey {
 }
 
 function Get-FreshInstallLicenseKeyFromCache {
-    $cachePath = Resolve-LicenseValidationCachePath -RootDirectory $InstallDir
+    $cachePath = Get-LicenseValidationCachePath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
-        $legacyPath = Get-LegacyLicenseValidationCachePath -RootDirectory $InstallDir
-        throw "The interrupted fresh install has no signed license cache at $cachePath or $legacyPath. Start over with uninstall-mailsite.ps1."
+        throw "The interrupted fresh install has no signed license cache at $cachePath. Start over with uninstall-mailsite.ps1."
     }
     try {
         $cache = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
@@ -2877,27 +2830,35 @@ function Normalize-PackageReleaseNotes {
         [string]$RootDirectory
     )
 
-    $packagePrimaryPath = Join-Path (Join-Path $PackageRoot $InstallDataDirectoryName) "release-notes.html"
+    $packagePrimaryPath = Join-Path $PackageRoot "release-notes.html"
+    $packageInstallPath = Join-Path (Join-Path $PackageRoot $InstallDataDirectoryName) "release-notes.html"
     $packageLegacyPath = Join-Path $PackageRoot "mailsite-release-notes.html"
-    $destinationDirectory = Join-Path $RootDirectory $InstallDataDirectoryName
-    $destinationPrimaryPath = Join-Path $destinationDirectory "release-notes.html"
+    $destinationPrimaryPath = Join-Path $RootDirectory "release-notes.html"
+    $destinationInstallPath = Join-Path (Join-Path $RootDirectory $InstallDataDirectoryName) "release-notes.html"
     $destinationLegacyPath = Join-Path $RootDirectory "mailsite-release-notes.html"
 
     if (Test-Path -LiteralPath $packagePrimaryPath -PathType Leaf) {
-        # The recursive package copy already installed the primary file. Remove
-        # only a stale root-level file left by an earlier build.
+        # The recursive package copy already installed the primary file.
+        Remove-Item -LiteralPath $destinationInstallPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $destinationLegacyPath -Force -ErrorAction SilentlyContinue
         return
     }
 
-    if (Test-Path -LiteralPath $packageLegacyPath -PathType Leaf) {
-        # Explicit older packages and supported downgrades still carry the old
-        # root filename. Normalize their own release notes instead of deleting
-        # them or retaining a newer package's stale primary file.
-        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
-        Copy-Item -LiteralPath $packageLegacyPath -Destination $destinationPrimaryPath -Force
+    $packageSourcePath = $null
+    if (Test-Path -LiteralPath $packageInstallPath -PathType Leaf) {
+        $packageSourcePath = $packageInstallPath
+    } elseif (Test-Path -LiteralPath $packageLegacyPath -PathType Leaf) {
+        $packageSourcePath = $packageLegacyPath
+    }
+
+    if ($null -ne $packageSourcePath) {
+        # Older packages used Install\release-notes.html or the root-level
+        # mailsite-release-notes.html name. Preserve their own notes during a
+        # downgrade while normalizing the installed layout to the current name.
+        Copy-Item -LiteralPath $packageSourcePath -Destination $destinationPrimaryPath -Force
+        Remove-Item -LiteralPath $destinationInstallPath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $destinationLegacyPath -Force -ErrorAction SilentlyContinue
-        Write-InstallerMessage "Moved package release notes to $destinationPrimaryPath."
+        Write-InstallerMessage "Normalized package release notes to $destinationPrimaryPath."
     }
 }
 

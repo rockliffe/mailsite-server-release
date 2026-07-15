@@ -23,7 +23,6 @@ $DesktopApps = @(
 
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallDataDirectoryName = "Install"
-$LegacyInstallDataDirectoryName = "Log"
 $InstallMarkerName = "install.json"
 $InstallerStateVersion = 2
 $FreshInstallStatusInProgress = "InProgress"
@@ -34,28 +33,6 @@ function Get-InstallMarkerPath {
     param([string]$RootDirectory)
 
     return Join-Path (Join-Path $RootDirectory $InstallDataDirectoryName) $InstallMarkerName
-}
-
-function Get-LegacyInstallMarkerPath {
-    param([string]$RootDirectory)
-
-    return Join-Path (Join-Path $RootDirectory $LegacyInstallDataDirectoryName) $InstallMarkerName
-}
-
-function Resolve-InstallMarkerPath {
-    param([string]$RootDirectory)
-
-    $primaryPath = Get-InstallMarkerPath -RootDirectory $RootDirectory
-    if (Test-Path -LiteralPath $primaryPath -PathType Leaf) {
-        return $primaryPath
-    }
-
-    $legacyPath = Get-LegacyInstallMarkerPath -RootDirectory $RootDirectory
-    if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
-        return $legacyPath
-    }
-
-    return $primaryPath
 }
 
 function Get-NormalizedMailSitePath {
@@ -477,10 +454,9 @@ function Remove-FreshInstallProductRegistry {
 }
 
 function Load-InstallerState {
-    $markerPath = Resolve-InstallMarkerPath -RootDirectory $InstallDir
+    $markerPath = Get-InstallMarkerPath -RootDirectory $InstallDir
     if (-not (Test-Path -LiteralPath $markerPath)) {
-        $legacyPath = Get-LegacyInstallMarkerPath -RootDirectory $InstallDir
-        throw "MailSite 11 installer state was not found at $markerPath or $legacyPath. Cannot safely uninstall."
+        throw "MailSite 11 installer state was not found at $markerPath. Cannot safely uninstall."
     }
 
     $json = Get-Content -LiteralPath $markerPath -Raw
@@ -619,7 +595,7 @@ function Uninstall-MailSite {
         Remove-FreshInstallProductRegistry -State $state -InstalledDirectory $installedDir
     }
 
-    $markerPath = Resolve-InstallMarkerPath -RootDirectory $installedDir
+    $markerPath = Get-InstallMarkerPath -RootDirectory $installedDir
     if ((Test-Path -LiteralPath $markerPath) -and (Test-Path -LiteralPath $installedDir)) {
         Write-UninstallerMessage "Removing MailSite 11 files from $installedDir..."
         Remove-Item -Path $installedDir -Recurse -Force
