@@ -455,19 +455,7 @@ function Invoke-MailSiteServiceControlPermissionRepair {
             return
         }
 
-        $applyGrant = [bool]$GrantServiceControl
-        if (-not $applyGrant) {
-            $prompt = "HTTPMA runs as $($audit.account), but that account is missing required MailSite permissions$detail. Grant them now? This does not change any service Log On As setting."
-            $applyGrant = Read-YesNo -Prompt $prompt -DefaultYes $true
-        }
-        if (-not $applyGrant) {
-            Write-MailSiteServiceControlRepairWarning `
-                -HttpmaPath $HttpmaPath `
-                -Reason "Required permissions for $($audit.account)$detail were not granted."
-            return
-        }
-
-        Write-InstallerMessage "Granting MailSite service-control and configuration permissions to $($audit.account)..."
+        Write-InstallerMessage "HTTPMA runs as $($audit.account), but that account is missing required MailSite permissions$detail. Granting them now. This does not change any service Log On As setting."
         $grantResult = Invoke-MailSiteExecutable `
             -FilePath $HttpmaPath `
             -ArgumentList @("grant-service-control")
