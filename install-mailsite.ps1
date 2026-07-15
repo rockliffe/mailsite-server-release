@@ -33,6 +33,12 @@ $DesktopApps = @(
     @{ Name = "Console"; File = "console.exe"; ShortcutName = "MailSite Console" }
 )
 
+# SMTPRA is a 64-bit service, but legacy SMTP hook DLLs are Win32. This helper
+# is therefore a versioned package/install component even though it is not a
+# Windows service of its own.
+$SmtpHookHost32 = @{ Name = "SMTPHookHost32"; File = "smtp-hook-host32.exe" }
+$SmtpHookHost32Machine = [uint16]0x014c
+
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallDataDirectoryName = "Install"
 $InstallMarkerName = "install.json"
@@ -773,6 +779,55 @@ function Get-ProductVersion {
     throw "Executable $Path has no FileVersion/ProductVersion resource."
 }
 
+function Get-PortableExecutableMachine {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Missing required executable: $Path"
+    }
+
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 64) {
+            throw "Executable $Path is too small to contain a valid PE header."
+        }
+
+        $reader = [IO.BinaryReader]::new($stream)
+        try {
+            if ($reader.ReadUInt16() -ne 0x5a4d) {
+                throw "Executable $Path does not have an MZ header."
+            }
+
+            $stream.Position = 0x3c
+            $peOffset = $reader.ReadUInt32()
+            if (([uint64]$peOffset + 6) -gt [uint64]$stream.Length) {
+                throw "Executable $Path has an invalid PE header offset."
+            }
+
+            $stream.Position = $peOffset
+            if ($reader.ReadUInt32() -ne 0x00004550) {
+                throw "Executable $Path does not have a valid PE signature."
+            }
+
+            return $reader.ReadUInt16()
+        } finally {
+            $reader.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-SmtpHookHost32Architecture {
+    param([string]$Path)
+
+    $machine = Get-PortableExecutableMachine -Path $Path
+    if ($machine -ne $SmtpHookHost32Machine) {
+        $actual = "0x{0:X4}" -f $machine
+        throw "SMTP hook compatibility host $Path must be Win32 IMAGE_FILE_MACHINE_I386 (0x014C); found PE Machine $actual."
+    }
+}
+
 function ConvertTo-MailSiteDisplayVersion {
     param([string]$Version)
 
@@ -1416,26 +1471,32 @@ function Resolve-RequestedPackageVersion {
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
-    $required = @("httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtpda.exe", "expresspro.exe", "console.exe")
-    $hasExecutables = $required | Where-Object { Test-Path -LiteralPath (Join-Path $ExtractRoot $_) }
-    if ($hasExecutables.Count -eq $required.Count) {
-        return $ExtractRoot
-    }
-
-    $children = Get-ChildItem -Path $ExtractRoot -Directory
+    $required = @("httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtp-hook-host32.exe", "smtpda.exe", "expresspro.exe", "console.exe")
+    $candidates = @($ExtractRoot)
+    $children = @(Get-ChildItem -Path $ExtractRoot -Directory)
     if ($children.Count -eq 1) {
-        return $children[0].FullName
+        $candidates += $children[0].FullName
     }
 
-    throw "Could not determine package root after extracting $ExtractRoot."
+    foreach ($candidate in $candidates) {
+        $hasExecutables = @($required | Where-Object { Test-Path -LiteralPath (Join-Path $candidate $_) -PathType Leaf })
+        if ($hasExecutables.Count -eq $required.Count) {
+            return $candidate
+        }
+    }
+
+    throw "Could not determine package root after extracting $ExtractRoot. Required package executables include $($required -join ', ')."
 }
 
 function Get-PackageVersion {
     param([string]$PackageRoot)
 
     $versions = @()
-    foreach ($service in $Services) {
-        $exe = Join-Path $PackageRoot $service.File
+    foreach ($component in @($Services) + @($SmtpHookHost32)) {
+        $exe = Join-Path $PackageRoot $component.File
+        if ($component.Name -eq $SmtpHookHost32.Name) {
+            Assert-SmtpHookHost32Architecture -Path $exe
+        }
         $version = Get-ProductVersion -Path $exe
         if ([string]::IsNullOrWhiteSpace($version) -or -not $version.StartsWith("$TargetMajorVersion.")) {
             throw "Package executable $exe has unexpected version '$version'."
@@ -1504,6 +1565,33 @@ function Get-InstalledMailSite11State {
         }
 
         $state.ComponentVersions[$service.Name] = ConvertTo-MailSiteDisplayVersion -Version $version
+    }
+
+    $hookHost = Join-Path $RootDirectory $SmtpHookHost32.File
+    if (-not (Test-Path -LiteralPath $hookHost -PathType Leaf)) {
+        $state.MissingComponents += $SmtpHookHost32.Name
+    } else {
+        try {
+            Assert-SmtpHookHost32Architecture -Path $hookHost
+            $hookHostVersion = Get-ProductVersion -Path $hookHost
+            if ([string]::IsNullOrWhiteSpace($hookHostVersion) -or -not $hookHostVersion.StartsWith("$TargetMajorVersion.")) {
+                $state.InvalidComponents += "$($SmtpHookHost32.Name) ($hookHostVersion)"
+            } else {
+                $hookHostDisplayVersion = ConvertTo-MailSiteDisplayVersion -Version $hookHostVersion
+                $serviceVersions = @($state.ComponentVersions.Values | Sort-Object -Unique)
+                if ($serviceVersions.Count -eq 1 -and $hookHostDisplayVersion -ne $serviceVersions[0]) {
+                    # Keep the service version as the installation comparison
+                    # version. Otherwise a stray newer helper makes the normal
+                    # same-version package look like a downgrade and bypasses
+                    # the repair that should replace the helper.
+                    $state.InvalidComponents += "$($SmtpHookHost32.Name) ($hookHostDisplayVersion; expected $($serviceVersions[0]))"
+                } else {
+                    $state.ComponentVersions[$SmtpHookHost32.Name] = $hookHostDisplayVersion
+                }
+            }
+        } catch {
+            $state.InvalidComponents += "$($SmtpHookHost32.Name) ($($_.Exception.Message))"
+        }
     }
 
     foreach ($service in $Services) {
@@ -1579,6 +1667,9 @@ function Get-MailSiteComponentVersionSummary {
         if ($InstalledState.ComponentVersions.ContainsKey($service.Name)) {
             $parts += "$($service.Name) $($InstalledState.ComponentVersions[$service.Name])"
         }
+    }
+    if ($InstalledState.ComponentVersions.ContainsKey($SmtpHookHost32.Name)) {
+        $parts += "$($SmtpHookHost32.Name) $($InstalledState.ComponentVersions[$SmtpHookHost32.Name])"
     }
 
     return ($parts -join ", ")
