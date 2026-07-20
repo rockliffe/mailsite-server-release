@@ -954,7 +954,7 @@ function Get-RemotePackageUrl {
     }
 
     if ($repoInfo.UseReleases) {
-        return "https://github.com/$($repoInfo.Owner)/$($repoInfo.Repo)/releases/download/v$Version/MailSite.$Version.zip"
+        return "https://github.com/$($repoInfo.Owner)/$($repoInfo.Repo)/releases/download/v$Version/MailSite.zip"
     }
 
     return "$($repoInfo.RawBaseUrl)/MailSite.$Version.zip"
