@@ -1325,7 +1325,7 @@ function Invoke-MailSitePackageDownload {
     Write-InstallerMessage "Downloading MailSite package to $DestinationPath..."
     & $curl.Source -f -# -L $Url -o $DestinationPath
     if ($LASTEXITCODE -ne 0) {
-        throw "Could not download MailSite package from $Url. curl.exe exited with code $LASTEXITCODE."
+        throw "Could not download MailSite package. curl.exe exited with code $LASTEXITCODE."
     }
 }
 
@@ -1377,7 +1377,7 @@ function Resolve-PackagePath {
         Assert-ZipPackageValid -Path $destinationPackage
         return $destinationPackage
     } catch {
-        throw "Could not prepare MailSite package. Pass -PackagePath or publish the requested MailSite zip to the release repository. $($_.Exception.Message)"
+        throw "$($_.Exception.Message) Please try again later or contact support@mailsite.com."
     }
 }
 
