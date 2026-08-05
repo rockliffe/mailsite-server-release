@@ -13,7 +13,9 @@ $Services = @(
     @{ Name = "IMAP4A"; File = "imap4a.exe" },
     @{ Name = "POP3A"; File = "pop3a.exe" },
     @{ Name = "SMTPRA"; File = "smtpra.exe" },
-    @{ Name = "SMTPDA"; File = "smtpda.exe" }
+    @{ Name = "SMTPDA"; File = "smtpda.exe" },
+    # Stop and remove the shared storage authority after its clients.
+    @{ Name = "MSDBMA"; File = "msdbma.exe"; LegacyService = $false }
 )
 
 $DesktopApps = @(
@@ -27,6 +29,11 @@ $InstallMarkerName = "install.json"
 $InstallerStateVersion = 2
 $FreshInstallStatusInProgress = "InProgress"
 $FreshInstallStatusComplete = "Complete"
+$MSDBMACredentialEnvironmentNames = @(
+    "MSDBMA_AUTH_MASTER_KEY",
+    "MSDBMA_SERVICE_TOKEN",
+    "MAILSITE_DEV_DEPLOY_MSDBMA_CREDENTIALS"
+)
 $script:LogPath = $null
 
 function Get-InstallMarkerPath {
@@ -226,6 +233,124 @@ function Test-MailSiteLegacyService {
     }
 
     return $true
+}
+
+function Get-MailSiteServiceEnvironmentEntries {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    $property = Get-ItemProperty -LiteralPath $path -Name Environment -ErrorAction SilentlyContinue
+    if ($null -eq $property -or $null -eq $property.Environment) { return @() }
+    return @($property.Environment | ForEach-Object { [string]$_ })
+}
+
+function Set-MailSiteServiceEnvironmentEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [string[]]$Entries
+    )
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if ($null -eq $Entries -or $Entries.Count -eq 0) {
+        Remove-ItemProperty -LiteralPath $path -Name Environment -ErrorAction SilentlyContinue
+        return
+    }
+    Set-ItemProperty -LiteralPath $path -Name Environment -Value @($Entries) -Type MultiString
+}
+
+function Remove-MSDBMACredentialEnvironmentEntries {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $before = @(Get-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName)
+    $after = @(
+        $before | Where-Object {
+            $entry = $_
+            -not @($MSDBMACredentialEnvironmentNames | Where-Object {
+                $entry.StartsWith("$_=", [StringComparison]::OrdinalIgnoreCase)
+            }).Count
+        }
+    )
+    if ($before.Count -eq $after.Count) { return $false }
+    Set-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName -Entries $after
+    return $true
+}
+
+function Set-MailSiteServiceRegistryAccessSddl {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$Sddl
+    )
+
+    $subkey = "SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $subkey,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        [Security.AccessControl.RegistryRights]::ChangePermissions
+    )
+    if ($null -eq $key) {
+        throw "Windows service registry key '$subkey' does not exist."
+    }
+    try {
+        $acl = New-Object Security.AccessControl.RegistrySecurity
+        $acl.SetSecurityDescriptorSddlForm(
+            $Sddl,
+            [Security.AccessControl.AccessControlSections]::Access
+        )
+        $key.SetAccessControl($acl)
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Get-UninstallerStateMapEntry {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$MapName,
+        [Parameter(Mandatory = $true)][string]$EntryName
+    )
+
+    $mapProperty = $State.PSObject.Properties[$MapName]
+    if ($null -eq $mapProperty -or $null -eq $mapProperty.Value) {
+        return [pscustomobject]@{ Found = $false; Value = $null }
+    }
+    $map = $mapProperty.Value
+    if ($map -is [System.Collections.IDictionary]) {
+        if ($map.Contains($EntryName)) {
+            return [pscustomobject]@{ Found = $true; Value = $map[$EntryName] }
+        }
+        return [pscustomobject]@{ Found = $false; Value = $null }
+    }
+    $entryProperty = $map.PSObject.Properties[$EntryName]
+    if ($null -eq $entryProperty) {
+        return [pscustomobject]@{ Found = $false; Value = $null }
+    }
+    return [pscustomobject]@{ Found = $true; Value = $entryProperty.Value }
+}
+
+function Restore-MailSiteLegacyServiceConfiguration {
+    param(
+        [Parameter(Mandatory = $true)][object]$State,
+        [Parameter(Mandatory = $true)][string]$ServiceName
+    )
+
+    if (Remove-MSDBMACredentialEnvironmentEntries -ServiceName $ServiceName) {
+        Write-UninstallerMessage "Removed MSDBMA credentials from the retained $ServiceName service configuration."
+    }
+
+    $aclSnapshot = Get-UninstallerStateMapEntry `
+        -State $State `
+        -MapName "PreviousServiceRegistryAccessSddl" `
+        -EntryName $ServiceName
+    if ($aclSnapshot.Found -and -not [string]::IsNullOrWhiteSpace([string]$aclSnapshot.Value)) {
+        Set-MailSiteServiceRegistryAccessSddl -ServiceName $ServiceName -Sddl ([string]$aclSnapshot.Value)
+        Write-UninstallerMessage "Restored the pre-install registry permissions for $ServiceName."
+    } else {
+        # Older installer markers did not preserve this harmless metadata. Keep
+        # the current ACL rather than guessing at permissions during rollback.
+        Write-UninstallerMessage "No pre-install registry-permission snapshot exists for $ServiceName; its current service-key permissions were retained." -Level "WARN"
+    }
 }
 
 function Resolve-UninstallServiceImagePath {
@@ -583,6 +708,7 @@ function Uninstall-MailSite {
                 $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)"
                 Set-ItemProperty -Path $path -Name ImagePath -Value $restorePaths[$service.Name]
                 Write-UninstallerMessage "Restored $($service.Name) service path to $($restorePaths[$service.Name])."
+                Restore-MailSiteLegacyServiceConfiguration -State $state -ServiceName $service.Name
             } else {
                 Remove-MailSiteWindowsService -ServiceName $service.Name
             }
