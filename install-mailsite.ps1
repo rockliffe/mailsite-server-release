@@ -18,6 +18,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $Services = @(
+    @{ Name = "MSDBMA"; File = "msdbma.exe"; Description = "MailSite Message Store and Database Management Agent"; LegacyService = $false },
     @{ Name = "HTTPMA"; File = "httpma.exe"; Description = "MailSite HTTP Management Agent" },
     @{ Name = "EWSMA"; File = "ewsma.exe"; Description = "MailSite EWS Management Agent"; LegacyService = $false },
     @{ Name = "MAPIMA"; File = "mapima.exe"; Description = "MailSite MAPI Management Agent"; LegacyService = $false },
@@ -27,6 +28,10 @@ $Services = @(
     @{ Name = "SMTPRA"; File = "smtpra.exe"; Description = "MailSite SMTP Receiving Agent" },
     @{ Name = "SMTPDA"; File = "smtpda.exe"; Description = "MailSite SMTP Delivery Agent" }
 )
+$MSDBMAClientServiceNames = @("HTTPMA", "EWSMA", "MAPIMA", "EASMA", "IMAP4A", "POP3A", "SMTPRA", "SMTPDA")
+$MSDBMAMasterKeyEnvironmentName = "MSDBMA_AUTH_MASTER_KEY"
+$MSDBMAServiceTokenEnvironmentName = "MSDBMA_SERVICE_TOKEN"
+$MSDBMACredentialContext = "mailsite-msdbma-client-v1:"
 
 $DesktopApps = @(
     @{ Name = "ExpressPro"; File = "expresspro.exe"; ShortcutName = "ExpressPro" },
@@ -516,6 +521,294 @@ function Set-ServiceDescription {
 
     $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
     Set-ItemProperty -Path $path -Name Description -Value $Description
+}
+
+function ConvertTo-Base64Url {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+    return [Convert]::ToBase64String($Bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
+function ConvertFrom-Base64Url {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $base64 = $Value.Trim().Replace("-", "+").Replace("_", "/")
+    switch ($base64.Length % 4) {
+        0 { }
+        2 { $base64 += "==" }
+        3 { $base64 += "=" }
+        default { throw "MSDBMA authentication master key is not valid base64url." }
+    }
+    try {
+        return [Convert]::FromBase64String($base64)
+    } catch {
+        throw "MSDBMA authentication master key is not valid base64url."
+    }
+}
+
+function New-MSDBMAAuthMasterKey {
+    $bytes = New-Object byte[] 32
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $generator.GetBytes($bytes)
+    } finally {
+        $generator.Dispose()
+    }
+    return ConvertTo-Base64Url -Bytes $bytes
+}
+
+function Get-MSDBMAServiceToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$MasterKey,
+        [Parameter(Mandatory = $true)][string]$ServiceName
+    )
+
+    if ($MSDBMAClientServiceNames -notcontains $ServiceName.ToUpperInvariant()) {
+        throw "$ServiceName is not an approved MSDBMA client."
+    }
+    $key = @(ConvertFrom-Base64Url -Value $MasterKey)
+    if ($key.Count -ne 32) {
+        throw "MSDBMA authentication master key must encode exactly 32 bytes."
+    }
+    $message = [Text.Encoding]::UTF8.GetBytes($MSDBMACredentialContext + $ServiceName.ToUpperInvariant())
+    $hmac = New-Object Security.Cryptography.HMACSHA256 -ArgumentList (,[byte[]]$key)
+    try {
+        return ConvertTo-Base64Url -Bytes $hmac.ComputeHash($message)
+    } finally {
+        $hmac.Dispose()
+    }
+}
+
+function Get-MailSiteServiceEnvironmentEntries {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    $property = Get-ItemProperty -LiteralPath $path -Name Environment -ErrorAction SilentlyContinue
+    if ($null -eq $property -or $null -eq $property.Environment) { return @() }
+    return @($property.Environment | ForEach-Object { [string]$_ })
+}
+
+function Set-MailSiteServiceEnvironmentEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [string[]]$Entries
+    )
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "Windows service '$ServiceName' is not installed."
+    }
+    if (@($Entries).Count -eq 0) {
+        Remove-ItemProperty -LiteralPath $path -Name Environment -ErrorAction SilentlyContinue
+        return
+    }
+    New-ItemProperty -LiteralPath $path -Name Environment -PropertyType MultiString -Value ([string[]]$Entries) -Force | Out-Null
+}
+
+function Get-MailSiteServiceEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $prefix = "$Name="
+    foreach ($entry in @(Get-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName)) {
+        if ($entry.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $entry.Substring($prefix.Length)
+        }
+    }
+    return $null
+}
+
+function Set-MailSiteServiceEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    $current = Get-MailSiteServiceEnvironmentVariable -ServiceName $ServiceName -Name $Name
+    if ($null -ne $current -and $current -ceq $Value) { return $false }
+    $prefix = "$Name="
+    $entries = @(
+        Get-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName |
+            Where-Object { -not $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }
+    )
+    $entries += "$Name=$Value"
+    Set-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName -Entries $entries
+    return $true
+}
+
+function Remove-MailSiteServiceEnvironmentVariable {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $prefix = "$Name="
+    $before = @(Get-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName)
+    $after = @($before | Where-Object { -not $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+    if ($before.Count -eq $after.Count) { return $false }
+    Set-MailSiteServiceEnvironmentEntries -ServiceName $ServiceName -Entries $after
+    return $true
+}
+
+function Protect-MailSiteServiceEnvironmentRegistryKey {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    # SCM injects this value as LocalSystem. The default service-registry ACL
+    # grants BUILTIN\Users read access, which is unsuitable for bearer
+    # credentials even though Services.msc does not display the value.
+    # Use RegistryKey directly. Get-Acl intermittently reports newly updated
+    # SCM service keys as absent through the PowerShell registry provider.
+    $subkey = "SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $rights = [Security.AccessControl.RegistryRights]::ReadPermissions -bor
+        [Security.AccessControl.RegistryRights]::ChangePermissions
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $subkey,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        $rights
+    )
+    if ($null -eq $key) {
+        throw "Windows service registry key '$subkey' does not exist."
+    }
+    try {
+        $acl = $key.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.GetAccessRules($true, $true, [Security.Principal.NTAccount]))) {
+            [void]$acl.RemoveAccessRuleSpecific($rule)
+        }
+        foreach ($identity in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators")) {
+            $rule = [Security.AccessControl.RegistryAccessRule]::new(
+                $identity,
+                [Security.AccessControl.RegistryRights]::FullControl,
+                [Security.AccessControl.InheritanceFlags]::ContainerInherit,
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+            $acl.AddAccessRule($rule)
+        }
+        $key.SetAccessControl($acl)
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Get-MailSiteServiceRegistryAccessSddl {
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $subkey = "SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $subkey,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
+        [Security.AccessControl.RegistryRights]::ReadPermissions
+    )
+    if ($null -eq $key) {
+        throw "Windows service registry key '$subkey' does not exist."
+    }
+    try {
+        $acl = $key.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+        return $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Set-MailSiteServiceRegistryAccessSddl {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [Parameter(Mandatory = $true)][string]$Sddl
+    )
+
+    $subkey = "SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $subkey,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        [Security.AccessControl.RegistryRights]::ChangePermissions
+    )
+    if ($null -eq $key) {
+        throw "Windows service registry key '$subkey' does not exist."
+    }
+    try {
+        $acl = New-Object Security.AccessControl.RegistrySecurity
+        $acl.SetSecurityDescriptorSddlForm(
+            $Sddl,
+            [Security.AccessControl.AccessControlSections]::Access
+        )
+        $key.SetAccessControl($acl)
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Test-MSDBMAServiceCredentialsConfigured {
+    if (-not (Test-MailSiteServiceInstalled -ServiceName "MSDBMA")) { return $false }
+    $masterKey = Get-MailSiteServiceEnvironmentVariable -ServiceName "MSDBMA" -Name $MSDBMAMasterKeyEnvironmentName
+    if ([string]::IsNullOrWhiteSpace($masterKey)) { return $false }
+    try {
+        foreach ($serviceName in $MSDBMAClientServiceNames) {
+            if (-not (Test-MailSiteServiceInstalled -ServiceName $serviceName)) { continue }
+            $expected = Get-MSDBMAServiceToken -MasterKey $masterKey -ServiceName $serviceName
+            $actual = Get-MailSiteServiceEnvironmentVariable -ServiceName $serviceName -Name $MSDBMAServiceTokenEnvironmentName
+            if ($actual -cne $expected) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Set-MSDBMAServiceCredentials {
+    if (-not (Test-MailSiteServiceInstalled -ServiceName "MSDBMA")) {
+        throw "MSDBMA must be installed before its service credentials can be provisioned."
+    }
+    $masterKey = Get-MailSiteServiceEnvironmentVariable -ServiceName "MSDBMA" -Name $MSDBMAMasterKeyEnvironmentName
+    $created = [string]::IsNullOrWhiteSpace($masterKey)
+    $rotated = $false
+    if (-not $created) {
+        try {
+            foreach ($serviceName in $MSDBMAClientServiceNames) {
+                [void](Get-MSDBMAServiceToken -MasterKey $masterKey -ServiceName $serviceName)
+            }
+        } catch {
+            $rotated = $true
+        }
+    }
+    if ($created -or $rotated) {
+        $masterKey = New-MSDBMAAuthMasterKey
+    }
+    foreach ($serviceName in $MSDBMAClientServiceNames) {
+        [void](Get-MSDBMAServiceToken -MasterKey $masterKey -ServiceName $serviceName)
+    }
+
+    $changed = Set-MailSiteServiceEnvironmentVariable -ServiceName "MSDBMA" -Name $MSDBMAMasterKeyEnvironmentName -Value $masterKey
+    if (Remove-MailSiteServiceEnvironmentVariable -ServiceName "MSDBMA" -Name $MSDBMAServiceTokenEnvironmentName) {
+        $changed = $true
+    }
+    foreach ($serviceName in $MSDBMAClientServiceNames) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $serviceName)) { continue }
+        $token = Get-MSDBMAServiceToken -MasterKey $masterKey -ServiceName $serviceName
+        if (Set-MailSiteServiceEnvironmentVariable -ServiceName $serviceName -Name $MSDBMAServiceTokenEnvironmentName -Value $token) {
+            $changed = $true
+        }
+        if (Remove-MailSiteServiceEnvironmentVariable -ServiceName $serviceName -Name $MSDBMAMasterKeyEnvironmentName) {
+            $changed = $true
+        }
+    }
+    foreach ($serviceName in @("MSDBMA") + $MSDBMAClientServiceNames) {
+        if (Test-MailSiteServiceInstalled -ServiceName $serviceName) {
+            Protect-MailSiteServiceEnvironmentRegistryKey -ServiceName $serviceName
+        }
+    }
+    return [pscustomobject]@{
+        Changed = [bool]$changed
+        Created = [bool]$created
+        Rotated = [bool]$rotated
+    }
 }
 
 function Stop-MailSiteService {
@@ -1471,7 +1764,7 @@ function Resolve-RequestedPackageVersion {
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
-    $required = @("httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtp-hook-host32.exe", "smtpda.exe", "expresspro.exe", "console.exe")
+    $required = @("msdbma.exe", "httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe", "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtp-hook-host32.exe", "smtpda.exe", "expresspro.exe", "console.exe")
     $candidates = @($ExtractRoot)
     $children = @(Get-ChildItem -Path $ExtractRoot -Directory)
     if ($children.Count -eq 1) {
@@ -1652,7 +1945,11 @@ function Get-InstalledMailSiteDisplayVersion {
 function Test-MailSiteInstallNeedsRepair {
     param([hashtable]$InstalledState)
 
-    return ($null -ne $InstalledState -and $InstalledState.IsInstalled -and ($InstalledState.IsPartial -or $InstalledState.IsMixed))
+    return (
+        $null -ne $InstalledState -and
+        $InstalledState.IsInstalled -and
+        ($InstalledState.IsPartial -or $InstalledState.IsMixed -or -not (Test-MSDBMAServiceCredentialsConfigured))
+    )
 }
 
 function Get-MailSiteComponentVersionSummary {
@@ -1855,6 +2152,7 @@ function New-FreshInstallState {
         ProductRegistryExistedBefore = $false
         PreviousImagePath = @{}
         PreviousDescription = @{}
+        PreviousServiceRegistryAccessSddl = @{}
         WasRunning = @{}
     }
 }
@@ -3138,6 +3436,9 @@ function Install-MailSiteFresh {
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
+        [void](Set-MSDBMAServiceCredentials)
+        Write-InstallerMessage "Provisioned private per-service credentials for MSDBMA authentication."
+
         $serviceAccountAudit = Get-MailSiteServiceAccountAudit
         Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
         Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
@@ -3340,6 +3641,8 @@ function Install-MailSite {
 
     $state = $null
     $rollbackImagePath = @{}
+    $rollbackServiceEnvironment = @{}
+    $rollbackServiceRegistryAccessSddl = @{}
     $createdServices = @()
     $servicesStopped = $false
 
@@ -3388,18 +3691,37 @@ function Install-MailSite {
             ProductRegistryExistedBefore = (Get-InstallerStatePropertyValue -State $existingState -PropertyName "ProductRegistryExistedBefore")
             PreviousImagePath = Copy-StateMap -State $existingState -PropertyName "PreviousImagePath"
             PreviousDescription = Copy-StateMap -State $existingState -PropertyName "PreviousDescription"
+            PreviousServiceRegistryAccessSddl = Copy-StateMap -State $existingState -PropertyName "PreviousServiceRegistryAccessSddl"
             WasRunning = @{}
         }
 
-        foreach ($service in $Services) {
+        # Stop protocol services before their storage authority. $Services is
+        # deliberately start-ordered, with MSDBMA first.
+        $stopOrder = @($Services | Where-Object { $_.Name -ne "MSDBMA" }) +
+            @($Services | Where-Object { $_.Name -eq "MSDBMA" })
+        foreach ($service in $stopOrder) {
             if (Test-MailSiteServiceInstalled -ServiceName $service.Name) {
                 $currentImagePath = Get-ServiceImagePath -ServiceName $service.Name
                 $rollbackImagePath[$service.Name] = $currentImagePath
+                $rollbackServiceEnvironment[$service.Name] = @(
+                    Get-MailSiteServiceEnvironmentEntries -ServiceName $service.Name
+                )
+                $currentRegistryAccessSddl = Get-MailSiteServiceRegistryAccessSddl -ServiceName $service.Name
+                $rollbackServiceRegistryAccessSddl[$service.Name] = $currentRegistryAccessSddl
                 if (-not $state.PreviousImagePath.ContainsKey($service.Name)) {
                     $state.PreviousImagePath[$service.Name] = $currentImagePath
                 }
                 if (-not $state.PreviousDescription.ContainsKey($service.Name)) {
                     $state.PreviousDescription[$service.Name] = Get-ServiceDescription -ServiceName $service.Name
+                }
+                if (-not $state.FreshInstall -and
+                    (Test-MailSiteLegacyService -Service $service) -and
+                    -not $state.PreviousServiceRegistryAccessSddl.ContainsKey($service.Name)) {
+                    # SDDL contains permissions, not credential values. Persisting
+                    # it lets uninstall restore the exact pre-v11 service-key ACL
+                    # without writing arbitrary service environment secrets into
+                    # install.json.
+                    $state.PreviousServiceRegistryAccessSddl[$service.Name] = $currentRegistryAccessSddl
                 }
                 $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
             } else {
@@ -3432,11 +3754,24 @@ function Install-MailSite {
             if (Test-MailSiteServiceInstalled -ServiceName $service.Name) {
                 Set-ServiceImagePath -ServiceName $service.Name -ExecutablePath $newExe
             } else {
+                # Newly introduced services use the established upgrade default:
+                # LocalSystem, followed by the normal account-mismatch audit.
                 Install-MailSiteWindowsService -Service $service -ExecutablePath $newExe -ServiceAccount $null
                 $createdServices += $service.Name
             }
             Set-ServiceDescription -ServiceName $service.Name -Description $service.Description
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
+        }
+
+        $credentialProvisioning = Set-MSDBMAServiceCredentials
+        if ($credentialProvisioning.Created) {
+            Write-InstallerMessage "Provisioned a new MSDBMA authentication master key and private per-service credentials."
+        } elseif ($credentialProvisioning.Rotated) {
+            Write-InstallerMessage "Replaced an invalid MSDBMA authentication master key and repaired every service credential."
+        } elseif ($credentialProvisioning.Changed) {
+            Write-InstallerMessage "Repaired MSDBMA private per-service credentials."
+        } else {
+            Write-InstallerMessage "MSDBMA private per-service credentials are already configured."
         }
 
         $serviceAccountAudit = Get-MailSiteServiceAccountAudit
@@ -3478,6 +3813,18 @@ function Install-MailSite {
                 }
                 if ($state.PreviousDescription.ContainsKey($service.Name)) {
                     Set-ServiceDescription -ServiceName $service.Name -Description $state.PreviousDescription[$service.Name]
+                }
+                if ($rollbackServiceEnvironment.ContainsKey($service.Name) -and
+                    (Test-MailSiteServiceInstalled -ServiceName $service.Name)) {
+                    Set-MailSiteServiceEnvironmentEntries `
+                        -ServiceName $service.Name `
+                        -Entries @($rollbackServiceEnvironment[$service.Name])
+                }
+                if ($rollbackServiceRegistryAccessSddl.ContainsKey($service.Name) -and
+                    (Test-MailSiteServiceInstalled -ServiceName $service.Name)) {
+                    Set-MailSiteServiceRegistryAccessSddl `
+                        -ServiceName $service.Name `
+                        -Sddl $rollbackServiceRegistryAccessSddl[$service.Name]
                 }
             }
         }
