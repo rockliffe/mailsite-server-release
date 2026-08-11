@@ -48,6 +48,7 @@ $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallDataDirectoryName = "Install"
 $InstallMarkerName = "install.json"
 $InstallerStateVersion = 3
+$SupportedPreviousInstallerStateVersions = @(2)
 $FreshInstallStatusInProgress = "InProgress"
 $FreshInstallStatusComplete = "Complete"
 $RequiredLegacyMajorVersion = "10"
@@ -1055,6 +1056,25 @@ function Copy-DirectoryAccessRules {
     Set-Acl -LiteralPath $DestinationDirectory -AclObject $destinationAcl
 }
 
+function Test-ShouldImportLegacyDirectoryAccessRules {
+    param(
+        [hashtable]$InstalledState,
+        [hashtable]$LegacyInfo
+    )
+
+    # Importing an inheritable DACL can cause Windows to touch every object
+    # below the destination. That is required only when creating the v11 tree
+    # from MailSite 10. A repair or v11-to-v11 upgrade already has its v11 ACL
+    # and may contain very large mailbox stores, so never re-propagate it.
+    return (
+        $null -ne $InstalledState -and
+        -not $InstalledState.HasV11Artifacts -and
+        $null -ne $LegacyInfo -and
+        -not [string]::IsNullOrWhiteSpace([string]$LegacyInfo.LegacyInstallDir) -and
+        (Test-Path -LiteralPath $LegacyInfo.LegacyInstallDir -PathType Container)
+    )
+}
+
 function Get-ProductVersion {
     param([string]$Path)
 
@@ -2014,8 +2034,70 @@ function Get-ExistingInstallerState {
 
     $json = Get-Content -LiteralPath $markerPath -Raw
     $state = $json | ConvertFrom-Json
-    Assert-InstallerStateVersion -State $state
+    $state = ConvertTo-CurrentInstallerState -State $state
     return $state
+}
+
+function Test-InstallerStateHasProperty {
+    param(
+        [object]$State,
+        [string]$PropertyName
+    )
+
+    if ($null -eq $State) {
+        return $false
+    }
+    if ($State -is [System.Collections.IDictionary]) {
+        return $State.Contains($PropertyName)
+    }
+    return $null -ne $State.PSObject.Properties[$PropertyName]
+}
+
+function ConvertTo-CurrentInstallerState {
+    param([object]$State)
+
+    if ($null -eq $State) {
+        return $null
+    }
+
+    $stateVersion = Get-InstallerStatePropertyValue -State $State -PropertyName "StateVersion"
+    if ($null -ne $stateVersion -and [int]$stateVersion -eq $InstallerStateVersion) {
+        Assert-InstallerStateVersion -State $State
+        return $State
+    }
+
+    if ($null -eq $stateVersion -or -not ($SupportedPreviousInstallerStateVersions -contains [int]$stateVersion)) {
+        Assert-InstallerStateVersion -State $State
+    }
+
+    $status = [string](Get-InstallerStatePropertyValue -State $State -PropertyName "InstallStatus")
+    if ($status -ne $FreshInstallStatusComplete) {
+        throw "Installer state version $stateVersion can be upgraded only when InstallStatus is Complete. Use the matching old installer to recover or remove an interrupted installation."
+    }
+
+    $stateDirectory = [string](Get-InstallerStatePropertyValue -State $State -PropertyName "InstallDir11")
+    if ([string]::IsNullOrWhiteSpace($stateDirectory) -or -not (Test-MailSitePathEqual -Left $stateDirectory -Right $InstallDir)) {
+        throw "Installer state version $stateVersion belongs to '$stateDirectory', not '$InstallDir'. Rerun the installer with the original -InstallDir."
+    }
+
+    $targetVersion = [string](Get-InstallerStatePropertyValue -State $State -PropertyName "TargetVersion")
+    if (-not (Test-ExactMailSiteVersion -Version $targetVersion)) {
+        throw "Installer state version $stateVersion has invalid TargetVersion '$targetVersion' and cannot be upgraded safely."
+    }
+
+    $requiredProperties = @(
+        "FreshInstall", "PreviousImagePath", "PreviousDescription",
+        "PreviousServiceRegistryAccessSddl", "WasRunning"
+    )
+    $missingProperties = @($requiredProperties | Where-Object { -not (Test-InstallerStateHasProperty -State $State -PropertyName $_) })
+    if ($missingProperties.Count -gt 0) {
+        throw "Installer state version $stateVersion is missing required property/properties: $($missingProperties -join ', '). Use the matching old uninstaller before installing this build."
+    }
+
+    Write-InstallerMessage "MailSite $targetVersion uses installer state version $stateVersion. Upgrading the completed installer state to version $InstallerStateVersion so this v11 installation can be upgraded in place." -Level "WARN"
+    Set-InstallerStatePropertyValue -State $State -PropertyName "StateVersion" -Value $InstallerStateVersion
+    Save-InstallerState -State $State
+    return $State
 }
 
 function Get-InstallerStatePropertyValue {
@@ -2204,7 +2286,10 @@ function Get-MailSiteInstallPrompt {
             }
             return "Reinstall MailSite ${TargetVersion}?"
         }
-        throw "MailSite 11 development builds cannot be upgraded or downgraded in place ($installedDisplayVersion -> $TargetVersion). Uninstall the existing v11 build, discard its v11-only state, and install the new build."
+        if ($comparison -gt 0) {
+            return "Upgrade MailSite $installedDisplayVersion to MailSite ${TargetVersion}?"
+        }
+        throw "MailSite 11 downgrades are not supported ($installedDisplayVersion -> $TargetVersion). Install a newer version or uninstall the existing v11 build first."
     }
 
     return "Install MailSite ${TargetVersion}?"
@@ -2222,6 +2307,13 @@ function Get-MailSiteInstallActionMessage {
         return "Installing MailSite $TargetVersion to $InstallDirectory..."
     }
 
+    $installedComparisonVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $InstalledState
+    if ((Test-ExactMailSiteVersion -Version $installedComparisonVersion) -and
+        (Test-ExactMailSiteVersion -Version $TargetVersion) -and
+        (Compare-MailSiteVersions -Left $TargetVersion -Right $installedComparisonVersion) -gt 0) {
+        return "Upgrading MailSite $installedDisplayVersion to MailSite $TargetVersion in $InstallDirectory..."
+    }
+
     $needsRepair = Test-MailSiteInstallNeedsRepair -InstalledState $InstalledState
     if ($needsRepair) {
         return "Repairing MailSite $installedDisplayVersion with MailSite $TargetVersion in $InstallDirectory..."
@@ -2234,7 +2326,8 @@ function New-InteractiveRemoteInstallRequest {
     param(
         [string]$TargetVersion,
         [string]$InstalledVersion,
-        [hashtable]$InstalledState
+        [hashtable]$InstalledState,
+        [bool]$UpgradeWarningShown = $false
     )
 
     $installedComparisonVersion = Get-InstalledMailSiteComparisonVersion -InstalledState $InstalledState
@@ -2243,10 +2336,7 @@ function New-InteractiveRemoteInstallRequest {
     }
 
     if ((Test-ExactMailSiteVersion -Version $TargetVersion) -and (Test-ExactMailSiteVersion -Version $installedComparisonVersion)) {
-        $comparison = Compare-MailSiteVersions -Left $TargetVersion -Right $installedComparisonVersion
-        if ($comparison -ne 0) {
-            throw "MailSite 11 development builds cannot be upgraded or downgraded in place ($installedComparisonVersion -> $TargetVersion). Uninstall the existing v11 build, discard its v11-only state, and install the new build."
-        }
+        Assert-MailSite11VersionTransition -InstalledVersion $installedComparisonVersion -TargetVersion $TargetVersion
     }
 
     return @{
@@ -2255,6 +2345,7 @@ function New-InteractiveRemoteInstallRequest {
         Interactive = $true
         SkipConfirm = $true
         Cancelled = $false
+        UpgradeWarningShown = $UpgradeWarningShown
     }
 }
 
@@ -2273,20 +2364,19 @@ function Resolve-InteractiveRemoteInstallRequest {
     if ([string]::IsNullOrWhiteSpace($installedComparisonVersion)) {
         $installedComparisonVersion = $InstalledVersion
     }
+    $targetVersion = $versions[0].ToString()
+    $upgradeWarningShown = $false
+    Write-InstallerMessage "Latest available MailSite version: $targetVersion."
     if (Test-ExactMailSiteVersion -Version $installedComparisonVersion) {
-        $targetVersion = $installedComparisonVersion
-        $available = @($versions | ForEach-Object { $_.ToString() })
-        if (-not ($available -contains $targetVersion)) {
-            throw "The exact MailSite $targetVersion package required to repair or reinstall this v11 build is not available. In-place upgrade or downgrade is not supported. Uninstall this v11 build and install the current package."
+        Assert-MailSite11VersionTransition -InstalledVersion $installedComparisonVersion -TargetVersion $targetVersion
+        if ((Compare-MailSiteVersions -Left $targetVersion -Right $installedComparisonVersion) -gt 0) {
+            Write-MailSite11UpgradeWarning -InstalledVersion $installedComparisonVersion -TargetVersion $targetVersion
+            $upgradeWarningShown = $true
         }
-        Write-InstallerMessage "Exact installed MailSite package available: $targetVersion."
-    } else {
-        $targetVersion = $versions[0].ToString()
-        Write-InstallerMessage "Latest available MailSite version: $targetVersion."
     }
 
     if (Read-YesNo -Prompt (Get-MailSiteInstallPrompt -InstalledVersion $InstalledVersion -InstalledState $InstalledState -TargetVersion $targetVersion) -DefaultYes $true) {
-        return New-InteractiveRemoteInstallRequest -TargetVersion $targetVersion -InstalledVersion $InstalledVersion -InstalledState $InstalledState
+        return New-InteractiveRemoteInstallRequest -TargetVersion $targetVersion -InstalledVersion $InstalledVersion -InstalledState $InstalledState -UpgradeWarningShown $upgradeWarningShown
     }
 
     Write-InstallerMessage "Installation cancelled by user."
@@ -2340,18 +2430,28 @@ function Assert-ExistingMailSite11Contract {
     }
 }
 
-function Assert-SameMailSite11Version {
+function Assert-MailSite11VersionTransition {
     param(
         [string]$InstalledVersion,
         [string]$TargetVersion
     )
 
-    if ((Test-ExactMailSiteVersion -Version $InstalledVersion) -and
-        (Test-ExactMailSiteVersion -Version $TargetVersion) -and
-        $InstalledVersion -eq $TargetVersion) {
-        return
+    if (-not (Test-ExactMailSiteVersion -Version $InstalledVersion) -or
+        -not (Test-ExactMailSiteVersion -Version $TargetVersion)) {
+        throw "Cannot determine a safe MailSite 11 version transition ('$InstalledVersion' -> '$TargetVersion')."
     }
-    throw "MailSite 11 development builds cannot be upgraded or downgraded in place ($InstalledVersion -> $TargetVersion). Run uninstall-mailsite.ps1, discard v11-only state, and install the new build. MailSite 10 conversion and rollback remain separate supported paths."
+    if ((Compare-MailSiteVersions -Left $TargetVersion -Right $InstalledVersion) -lt 0) {
+        throw "MailSite 11 downgrades are not supported ($InstalledVersion -> $TargetVersion). Install a newer version or uninstall the existing v11 build first."
+    }
+}
+
+function Write-MailSite11UpgradeWarning {
+    param(
+        [string]$InstalledVersion,
+        [string]$TargetVersion
+    )
+
+    Write-InstallerMessage "Upgrading MailSite $InstalledVersion to $TargetVersion in place. MailSite 11 is still in development; back up MailSite data first because development database schemas may be rebuilt by the newer services." -Level "WARN"
 }
 
 function Compare-MailSiteVersions {
@@ -3404,7 +3504,7 @@ function Install-MailSite {
         if ($installedState.InvalidComponents.Count -gt 0) {
             Write-InstallerMessage "Existing MailSite 11 install has invalid component(s): $($installedState.InvalidComponents -join ', '). An exact-version repair may restore them." -Level "WARN"
         }
-        # Repairing/reinstalling the exact existing v11 build. MailSite 10 may
+        # Repairing, reinstalling, or upgrading the existing v11 build. MailSite 10 may
         # still exist after a supported conversion; use it for permission
         # copying, but do not require it for a same-build v11 repair.
         try {
@@ -3419,7 +3519,7 @@ function Install-MailSite {
                 throw
             }
             $legacy = $null
-            Write-InstallerMessage "MailSite 10 is no longer present; performing an exact-version MailSite 11 repair/reinstall. Rollback to MailSite 10 will not be available." -Level "WARN"
+            Write-InstallerMessage "MailSite 10 is no longer present; continuing with the MailSite 11 installation. Rollback to MailSite 10 will not be available." -Level "WARN"
             $installedLicenseKey = Get-RegistryString -Path $MailSiteKey32 -Name "License"
             Assert-MailSiteLicenseValidatedOnline `
                 -LicenseKey $installedLicenseKey `
@@ -3447,7 +3547,14 @@ function Install-MailSite {
     }
 
     if ($installedState.HasV11Artifacts) {
-        Assert-SameMailSite11Version -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+        Assert-MailSite11VersionTransition -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+        $isV11Upgrade = (Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion) -gt 0
+        if ($isV11Upgrade) {
+            $installRequest.ForceReinstall = $true
+            if (-not [bool]$installRequest.UpgradeWarningShown) {
+                Write-MailSite11UpgradeWarning -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+            }
+        }
         if (-not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
             $serviceAccountAudit = Get-MailSiteServiceAccountAudit
             Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
@@ -3481,7 +3588,7 @@ function Install-MailSite {
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
 
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
-            Assert-SameMailSite11Version -InstalledVersion $installedVersion -TargetVersion $targetVersion
+            Assert-MailSite11VersionTransition -InstalledVersion $installedVersion -TargetVersion $targetVersion
             if (-not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
                 $serviceAccountAudit = Get-MailSiteServiceAccountAudit
                 Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
@@ -3556,7 +3663,7 @@ function Install-MailSite {
 
         Stop-MailSiteDesktopApps -RootDirectory $InstallDir
 
-        if ($legacy -and -not [string]::IsNullOrWhiteSpace($legacy.LegacyInstallDir) -and (Test-Path -LiteralPath $legacy.LegacyInstallDir)) {
+        if (Test-ShouldImportLegacyDirectoryAccessRules -InstalledState $installedState -LegacyInfo $legacy) {
             Write-InstallerMessage "Copying directory permissions from $($legacy.LegacyInstallDir) to $InstallDir..."
             Copy-DirectoryAccessRules -SourceDirectory $legacy.LegacyInstallDir -DestinationDirectory $InstallDir
         }
