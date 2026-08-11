@@ -26,7 +26,7 @@ $DesktopApps = @(
 $MailSiteKey32 = "HKLM:\SOFTWARE\Wow6432Node\Rockliffe\MailSite"
 $InstallDataDirectoryName = "Install"
 $InstallMarkerName = "install.json"
-$InstallerStateVersion = 2
+$InstallerStateVersion = 3
 $FreshInstallStatusInProgress = "InProgress"
 $FreshInstallStatusComplete = "Complete"
 $MSDBMACredentialEnvironmentNames = @(
@@ -67,7 +67,7 @@ function Get-UninstallerStateStatus {
     Assert-UninstallerStateVersion -State $State
     $property = $State.PSObject.Properties["InstallStatus"]
     if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-        return $FreshInstallStatusComplete
+        throw "Installer state is missing InstallStatus and is not a current MailSite 11 state. Use the matching old uninstaller or remove the old v11 installation manually after backup."
     }
     $status = [string]$property.Value
     if ($status -ne $FreshInstallStatusInProgress -and $status -ne $FreshInstallStatusComplete) {
@@ -80,8 +80,9 @@ function Assert-UninstallerStateVersion {
     param([object]$State)
 
     $versionProperty = $State.PSObject.Properties["StateVersion"]
-    if ($null -ne $versionProperty -and [int]$versionProperty.Value -ne $InstallerStateVersion) {
-        throw "Installer state uses unsupported StateVersion '$($versionProperty.Value)'."
+    if ($null -eq $versionProperty -or [int]$versionProperty.Value -ne $InstallerStateVersion) {
+        $reportedVersion = if ($null -eq $versionProperty) { "missing" } else { [string]$versionProperty.Value }
+        throw "Installer state uses unsupported StateVersion '$reportedVersion'; this uninstaller requires StateVersion $InstallerStateVersion. MailSite 11 development installer states are not upgraded. Use the uninstaller from the matching old build, then rebuild the v11 installation."
     }
 }
 
@@ -93,7 +94,7 @@ function Resolve-UninstallerStateDirectory {
 
     $stateDirectory = [string]$State.InstallDir11
     if ([string]::IsNullOrWhiteSpace($stateDirectory)) {
-        return $MarkerRoot
+        throw "Current installer state is missing InstallDir11. Refusing elevated cleanup; use the uninstaller from the matching build."
     }
     if (-not (Test-MailSitePathEqual -Left $stateDirectory -Right $MarkerRoot)) {
         throw "Installer state at '$MarkerRoot' belongs to '$stateDirectory'. Rerun uninstall with the original -InstallDir; no changes were made."
@@ -347,8 +348,8 @@ function Restore-MailSiteLegacyServiceConfiguration {
         Set-MailSiteServiceRegistryAccessSddl -ServiceName $ServiceName -Sddl ([string]$aclSnapshot.Value)
         Write-UninstallerMessage "Restored the pre-install registry permissions for $ServiceName."
     } else {
-        # Older installer markers did not preserve this harmless metadata. Keep
-        # the current ACL rather than guessing at permissions during rollback.
+        # A damaged current marker may lack this harmless metadata. Keep the
+        # current ACL rather than guessing at permissions during v10 rollback.
         Write-UninstallerMessage "No pre-install registry-permission snapshot exists for $ServiceName; its current service-key permissions were retained." -Level "WARN"
     }
 }
@@ -587,6 +588,10 @@ function Load-InstallerState {
     $json = Get-Content -LiteralPath $markerPath -Raw
     $state = $json | ConvertFrom-Json
     Assert-UninstallerStateVersion -State $state
+    [void](Get-UninstallerStateStatus -State $state)
+    if ([string]$state.TargetVersion -notmatch '^11\.[0-9]+\.[0-9]+$') {
+        throw "Installer state has invalid TargetVersion '$($state.TargetVersion)'. Refusing to treat it as a current MailSite 11 installation."
+    }
     return $state
 }
 
@@ -637,11 +642,11 @@ function Uninstall-MailSite {
     # MailSite 11 installs written by the fresh-install flow record FreshInstall in
     # the marker: there is no MailSite 10 to revert to, so the services created by
     # the fresh install are deleted outright instead of being re-pointed.
-    $freshInstall = $false
     $freshInstallProperty = $state.PSObject.Properties["FreshInstall"]
-    if ($null -ne $freshInstallProperty) {
-        $freshInstall = [bool]$freshInstallProperty.Value
+    if ($null -eq $freshInstallProperty) {
+        throw "Current installer state is missing FreshInstall. Use the uninstaller from the matching build; no changes were made."
     }
+    $freshInstall = [bool]$freshInstallProperty.Value
 
     # Prove registry ownership before stopping/removing any service. A stale or
     # contradictory marker must leave the existing installation untouched.
