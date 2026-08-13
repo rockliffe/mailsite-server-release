@@ -1757,7 +1757,7 @@ function Resolve-InstallRequest {
         }
     }
 
-    throw "Unknown install target '$target'. Use no argument for latest, 'reinstall' to force latest reinstall, or an exact version such as 11.0.112."
+    throw "Unknown install target '$target'. Use no argument for latest, 'reinstall' to replace the detected build (or use latest when the binaries conflict), or an exact version such as 11.0.112."
 }
 
 function Resolve-RequestedPackageVersion {
@@ -1978,7 +1978,10 @@ function Get-InstalledMailSiteComparisonVersion {
         return $null
     }
 
-    return $InstalledState.NewestVersion
+    # A mixed installation has no meaningful source version. Callers may
+    # still replace it with a complete package, but must not classify that
+    # repair as an upgrade or downgrade from an arbitrary component build.
+    return $InstalledState.ExactVersion
 }
 
 function Get-InstalledMailSiteDisplayVersion {
@@ -2350,6 +2353,10 @@ function Get-MailSiteInstallPrompt {
         return "Downgrade MailSite $installedDisplayVersion to MailSite ${TargetVersion}?"
     }
 
+    if ($needsRepair -and $null -ne $InstalledState -and $InstalledState.HasV11Artifacts) {
+        return "Repair MailSite $installedDisplayVersion with MailSite ${TargetVersion}?"
+    }
+
     return "Install MailSite ${TargetVersion}?"
 }
 
@@ -2405,7 +2412,7 @@ function New-InteractiveRemoteInstallRequest {
 
     return @{
         RemoteVersion = $TargetVersion
-        ForceReinstall = -not [string]::IsNullOrWhiteSpace($installedComparisonVersion)
+        ForceReinstall = ($null -ne $InstalledState -and $InstalledState.HasV11Artifacts)
         Interactive = $true
         SkipConfirm = $true
         Cancelled = $false
@@ -2541,10 +2548,11 @@ function Assert-ExistingMailSite11Contract {
         return
     }
     if ($InstalledState.IsMixed) {
-        throw "Existing MailSite 11 components are from mixed builds: $(Get-MailSiteComponentVersionSummary -InstalledState $InstalledState). Mixed v11 builds cannot be repaired or upgraded in place. Run uninstall-mailsite.ps1, discard v11-only state, and install one matching build."
+        Write-InstallerMessage "Existing MailSite 11 components are from mixed builds: $(Get-MailSiteComponentVersionSummary -InstalledState $InstalledState). The installation is damaged, but a complete MailSite package can replace it." -Level "WARN"
+        return
     }
-    if (-not (Test-ExactMailSiteVersion -Version $detectedVersion) -or $detectedVersion -ne $stateTarget) {
-        throw "Existing MailSite 11 files report version '$detectedVersion', but the current installer state requires '$stateTarget'. Different v11 builds cannot be combined. Run uninstall-mailsite.ps1, discard v11-only state, and install one matching build."
+    if ((Test-ExactMailSiteVersion -Version $detectedVersion) -and $detectedVersion -ne $stateTarget) {
+        Write-InstallerMessage "Existing MailSite 11 binaries report version '$detectedVersion', while install.json records '$stateTarget'. Using the coherent binary version as the installed version." -Level "WARN"
     }
 }
 
@@ -2566,7 +2574,7 @@ function Write-MailSite11UpgradeWarning {
         [string]$TargetVersion
     )
 
-    Write-InstallerMessage "Upgrading MailSite $InstalledVersion to $TargetVersion in place. MailSite 11 is still in development; back up MailSite data first because the installed services may find incompatible development schemas and ask to delete them before restart." -Level "WARN"
+    Write-InstallerMessage "Upgrading MailSite $InstalledVersion to $TargetVersion in place. MailSite 11 is still in development; back up MailSite data first because MSDBMA may apply forward-only database migrations during indexing. Databases that cannot be migrated remain unopened and their indexing errors are shown in the Console DB view." -Level "WARN"
 }
 
 function Write-MailSite11DowngradeWarning {
@@ -2575,7 +2583,7 @@ function Write-MailSite11DowngradeWarning {
         [string]$TargetVersion
     )
 
-    Write-InstallerMessage "Downgrading MailSite $InstalledVersion to $TargetVersion in place. Existing MailSite 11 databases are not rolled back. The installer will check them before restart when the target package supports schema inspection; otherwise it will warn and continue without a schema verdict." -Level "WARN"
+    Write-InstallerMessage "Downgrading MailSite $InstalledVersion to $TargetVersion in place. Existing MailSite 11 databases are not downgraded. MSDBMA will automatically apply supported forward migrations when it indexes them; a database newer than this target build will remain unopened and its indexing error will be shown in the Console DB view." -Level "WARN"
 }
 
 function Compare-MailSiteVersions {
@@ -2670,185 +2678,6 @@ function Invoke-MailSiteExecutable {
     } finally {
         $ErrorActionPreference = $previousPreference
     }
-}
-
-function Invoke-MailSiteDatabaseSchemaReport {
-    param(
-        [string]$MsdbmaPath,
-        [switch]$DeleteIncompatible
-    )
-
-    if ([string]::IsNullOrWhiteSpace($MsdbmaPath) -or
-        -not (Test-Path -LiteralPath $MsdbmaPath -PathType Leaf)) {
-        return @{
-            Available = $false
-            Error = "The target package does not include MSDBMA schema inspection."
-            Report = $null
-        }
-    }
-
-    $arguments = @("database-schemas", "--json")
-    if ($DeleteIncompatible) {
-        $arguments += "--delete-incompatible"
-    }
-
-    try {
-        $result = Invoke-MailSiteExecutable -FilePath $MsdbmaPath -ArgumentList $arguments
-    } catch {
-        return @{
-            Available = $false
-            Error = $_.Exception.Message
-            Report = $null
-        }
-    }
-    if ($result.ExitCode -ne 0) {
-        return @{
-            Available = $false
-            Error = "MSDBMA schema inspection exited with code $($result.ExitCode): $($result.Output -join ' ')"
-            Report = $null
-        }
-    }
-
-    try {
-        $report = ($result.Output -join [Environment]::NewLine) | ConvertFrom-Json
-    } catch {
-        return @{
-            Available = $false
-            Error = "MSDBMA did not return a valid database schema report: $($_.Exception.Message)"
-            Report = $null
-        }
-    }
-    if ($null -eq $report -or [int]$report.schemaVersion -ne 1) {
-        $reportedVersion = if ($null -eq $report) { "missing" } else { [string]$report.schemaVersion }
-        return @{
-            Available = $false
-            Error = "MSDBMA returned unsupported database schema report version '$reportedVersion'."
-            Report = $null
-        }
-    }
-    $requiredProperties = @(
-        "buildVersion", "compatible", "databases", "discoveryErrors",
-        "deletedDatabases", "deletionErrors"
-    )
-    $missingProperties = @($requiredProperties | Where-Object { $null -eq $report.PSObject.Properties[$_] })
-    if ($missingProperties.Count -gt 0) {
-        return @{
-            Available = $false
-            Error = "MSDBMA database schema report is missing required properties: $($missingProperties -join ', ')."
-            Report = $null
-        }
-    }
-
-    return @{
-        Available = $true
-        Error = $null
-        Report = $report
-    }
-}
-
-function Resolve-MailSitePostInstallDatabaseSchemas {
-    param(
-        [string]$MsdbmaPath,
-        [switch]$AllowUnavailable
-    )
-
-    Write-InstallerMessage "Checking existing MailSite 11 database schemas with the target package's MSDBMA build..."
-    $inspection = Invoke-MailSiteDatabaseSchemaReport -MsdbmaPath $MsdbmaPath
-    if (-not $inspection.Available) {
-        Write-InstallerMessage "Could not verify the existing database schemas: $($inspection.Error)" -Level "WARN"
-        if ($AllowUnavailable) {
-            Write-InstallerMessage "Continuing the downgrade without database schema verification. The target package does not provide a usable schema checker; its services may fail to start or may be unable to open databases created by a newer build." -Level "WARN"
-            return $true
-        }
-        Write-InstallerMessage "The package remains installed, but MailSite services will stay stopped so an incompatible database is not opened." -Level "WARN"
-        return $false
-    }
-
-    $report = $inspection.Report
-    $discoveryErrors = @($report.discoveryErrors)
-    $incompatible = @($report.databases | Where-Object { -not [bool]$_.compatible })
-    if ($incompatible.Count -eq 0) {
-        if ($discoveryErrors.Count -gt 0) {
-            foreach ($errorMessage in $discoveryErrors) {
-                Write-InstallerMessage "Database discovery error: $errorMessage" -Level "WARN"
-            }
-            if ($AllowUnavailable) {
-                Write-InstallerMessage "Continuing the downgrade without complete database schema verification. The target services may fail to start or open an undiscovered database." -Level "WARN"
-                return $true
-            }
-            Write-InstallerMessage "The package remains installed, but MailSite services will stay stopped because schema inspection was incomplete." -Level "WARN"
-            return $false
-        }
-        if (-not [bool]$report.compatible) {
-            if ($AllowUnavailable) {
-                Write-InstallerMessage "MSDBMA could not provide a complete schema verdict. Continuing the downgrade without complete database schema verification; the target services may fail to start or open an existing database." -Level "WARN"
-                return $true
-            }
-            Write-InstallerMessage "MSDBMA reported that the database set is incompatible but did not identify a database that can be removed safely. The package remains installed and MailSite services will stay stopped." -Level "WARN"
-            return $false
-        }
-        Write-InstallerMessage "All discovered MailSite 11 databases are compatible with the installed services."
-        return $true
-    }
-
-    Write-InstallerMessage "Found $($incompatible.Count) database(s) whose schemas are incompatible with MailSite $($report.buildVersion)." -Level "WARN"
-    $groups = @($incompatible | Group-Object databaseKind, actualVersion, requiredVersion)
-    foreach ($group in $groups) {
-        $sample = $group.Group[0]
-        $actualVersion = if ($null -eq $sample.actualVersion) { "unreadable" } else { [string]$sample.actualVersion }
-        Write-InstallerMessage "  $($sample.databaseKind): $($group.Count) database(s), actual schema $actualVersion, required schema $($sample.requiredVersion)" -Level "WARN"
-    }
-    foreach ($database in @($incompatible | Select-Object -First 10)) {
-        Write-InstallerMessage "  $($database.path)" -Level "WARN"
-        $detailProperty = $database.PSObject.Properties["detail"]
-        if ($null -ne $detailProperty -and -not [string]::IsNullOrWhiteSpace([string]$detailProperty.Value)) {
-            Write-InstallerMessage "    $($detailProperty.Value)" -Level "WARN"
-        }
-    }
-    if ($incompatible.Count -gt 10) {
-        Write-InstallerMessage "  ...and $($incompatible.Count - 10) more incompatible database(s)." -Level "WARN"
-    }
-    foreach ($errorMessage in $discoveryErrors) {
-        Write-InstallerMessage "Database discovery error: $errorMessage" -Level "WARN"
-    }
-
-    $deleteAccepted = Read-YesNo -Prompt "Delete the incompatible MailSite 11 databases now? Their contents will be permanently lost." -DefaultYes $false
-    if (-not $deleteAccepted) {
-        Write-InstallerMessage "The incompatible databases were retained. The package and Windows service registrations are installed, but MailSite services will stay stopped." -Level "WARN"
-        return $false
-    }
-
-    Write-InstallerMessage "Deleting the incompatible MailSite 11 databases accepted by the operator..." -Level "WARN"
-    $cleanup = Invoke-MailSiteDatabaseSchemaReport -MsdbmaPath $MsdbmaPath -DeleteIncompatible
-    if (-not $cleanup.Available) {
-        Write-InstallerMessage "Database deletion could not be verified: $($cleanup.Error)" -Level "WARN"
-        Write-InstallerMessage "The package remains installed, but MailSite services will stay stopped." -Level "WARN"
-        return $false
-    }
-
-    $cleanupReport = $cleanup.Report
-    foreach ($errorMessage in @($cleanupReport.deletionErrors)) {
-        Write-InstallerMessage "Database deletion error: $errorMessage" -Level "WARN"
-    }
-    foreach ($errorMessage in @($cleanupReport.discoveryErrors)) {
-        Write-InstallerMessage "Database discovery error after deletion: $errorMessage" -Level "WARN"
-    }
-    $remaining = @($cleanupReport.databases | Where-Object { -not [bool]$_.compatible })
-    if ($remaining.Count -gt 0 -or @($cleanupReport.deletionErrors).Count -gt 0) {
-        Write-InstallerMessage "Database cleanup was incomplete; $($remaining.Count) incompatible database(s) remain. MailSite services will stay stopped." -Level "WARN"
-        return $false
-    }
-    if (@($cleanupReport.discoveryErrors).Count -gt 0 -or -not [bool]$cleanupReport.compatible) {
-        if ($AllowUnavailable) {
-            Write-InstallerMessage "Known incompatible databases were deleted, but schema discovery could not be completed. Continuing the downgrade without complete verification; the target services may fail to start or open an undiscovered database." -Level "WARN"
-            return $true
-        }
-        Write-InstallerMessage "Database cleanup could not be verified completely. MailSite services will stay stopped." -Level "WARN"
-        return $false
-    }
-
-    Write-InstallerMessage "Deleted $(@($cleanupReport.deletedDatabases).Count) incompatible database(s). MailSite will rebuild them with the installed schema when the services start."
-    return $true
 }
 
 function Read-MaskedInput {
@@ -3841,10 +3670,10 @@ function Install-MailSite {
     } else {
         Write-InstallerMessage "Detected existing MailSite $installedDisplayVersion in $InstallDir."
         if ($installedState.MissingComponents.Count -gt 0) {
-            Write-InstallerMessage "Existing MailSite 11 install is missing component(s): $($installedState.MissingComponents -join ', '). An exact-version repair may restore them."
+            Write-InstallerMessage "Existing MailSite 11 install is missing component(s): $($installedState.MissingComponents -join ', '). A complete-package repair will replace the installed service set."
         }
         if ($installedState.InvalidComponents.Count -gt 0) {
-            Write-InstallerMessage "Existing MailSite 11 install has invalid component(s): $($installedState.InvalidComponents -join ', '). An exact-version repair may restore them." -Level "WARN"
+            Write-InstallerMessage "Existing MailSite 11 install has invalid component(s): $($installedState.InvalidComponents -join ', '). A complete-package repair will replace the installed service set." -Level "WARN"
         }
         # Repairing, reinstalling, or upgrading the existing v11 build. MailSite 10 may
         # still exist after a supported conversion; use it for permission
@@ -3873,9 +3702,14 @@ function Install-MailSite {
     $installRequest = Resolve-InstallRequest
     if ($installedState.HasV11Artifacts -and $installRequest.ForceReinstall -and
         [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
-        # `reinstall` means the exact installed build. Downloading "latest"
-        # here would silently turn repair into an unrequested v11 upgrade.
-        $installRequest.RemoteVersion = $installedVersion
+        if (Test-ExactMailSiteVersion -Version $installedVersion) {
+            # A coherent installation can reinstall its exact detected build.
+            $installRequest.RemoteVersion = $installedVersion
+        } else {
+            # No single source build exists. Reinstalling the latest complete
+            # package is the only deterministic repair for mixed binaries.
+            Write-InstallerMessage "The installed MailSite binaries do not report one version. Reinstall will replace the damaged installation with the latest available build." -Level "WARN"
+        }
     }
 
     if ($installRequest.Interactive -and [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
@@ -3889,21 +3723,27 @@ function Install-MailSite {
     }
 
     if ($installedState.HasV11Artifacts) {
-        Assert-MailSite11VersionTransition -InstalledVersion $installedVersion -TargetVersion $requestedVersion
-        $versionComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
-        if ($versionComparison -ne 0) {
+        $needsRepair = Test-MailSiteInstallNeedsRepair -InstalledState $installedState
+        if ($needsRepair) {
             $installRequest.ForceReinstall = $true
         }
-        if ($versionComparison -gt 0) {
-            if (-not [bool]$installRequest.UpgradeWarningShown) {
-                Write-MailSite11UpgradeWarning -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+        if (Test-ExactMailSiteVersion -Version $installedVersion) {
+            Assert-MailSite11VersionTransition -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+            $versionComparison = Compare-MailSiteVersions -Left $requestedVersion -Right $installedVersion
+            if ($versionComparison -ne 0) {
+                $installRequest.ForceReinstall = $true
             }
-        } elseif ($versionComparison -lt 0) {
-            if (-not [bool]$installRequest.DowngradeWarningShown) {
-                Write-MailSite11DowngradeWarning -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+            if ($versionComparison -gt 0) {
+                if (-not [bool]$installRequest.UpgradeWarningShown) {
+                    Write-MailSite11UpgradeWarning -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+                }
+            } elseif ($versionComparison -lt 0) {
+                if (-not [bool]$installRequest.DowngradeWarningShown) {
+                    Write-MailSite11DowngradeWarning -InstalledVersion $installedVersion -TargetVersion $requestedVersion
+                }
             }
         }
-        if (-not $installRequest.ForceReinstall -and -not (Test-MailSiteInstallNeedsRepair -InstalledState $installedState)) {
+        if (-not $installRequest.ForceReinstall -and -not $needsRepair) {
             $serviceAccountAudit = Get-MailSiteServiceAccountAudit
             Write-MailSiteServiceAccountMismatchWarning -Audit $serviceAccountAudit
             Set-MailSiteInstallDataDirectoryAcl -RootDirectory $InstallDir -Audit $serviceAccountAudit
@@ -3936,8 +3776,6 @@ function Install-MailSite {
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
         $targetServices = @(Get-PackageServices -PackageRoot $packageRoot)
         $targetHasMSDBMA = @($targetServices | Where-Object { $_.Name -eq "MSDBMA" }).Count -eq 1
-        $isDowngrade = (Test-ExactMailSiteVersion -Version $installedVersion) -and
-            ((Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion) -lt 0)
         if (-not $targetHasMSDBMA -and -not $installedState.HasV11Artifacts) {
             throw "A pre-MSDBMA MailSite package can be used only to downgrade an existing completed v11 installation."
         }
@@ -4071,16 +3909,6 @@ function Install-MailSite {
         [void](Invoke-MailSiteServiceControlPermissionRepair -HttpmaPath (Join-Path $InstallDir "httpma.exe"))
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
-
-        $schemaCheckerPath = if ($targetHasMSDBMA) { Join-Path $InstallDir "msdbma.exe" } else { $null }
-        $allowUnavailableSchemaCheck = $isDowngrade -or (-not $targetHasMSDBMA -and $installedState.HasV11Artifacts)
-        $schemasReady = Resolve-MailSitePostInstallDatabaseSchemas `
-            -MsdbmaPath $schemaCheckerPath `
-            -AllowUnavailable:$allowUnavailableSchemaCheck
-        if (-not $schemasReady) {
-            Write-InstallerMessage "MailSite $targetVersion installation completed. Previously running services were deliberately left stopped pending database schema resolution." -Level "WARN"
-            return
-        }
 
         $startNewServices = (@($state.WasRunning.Values | Where-Object { $_ -eq $true }).Count -gt 0)
         $restartRequested = @()
