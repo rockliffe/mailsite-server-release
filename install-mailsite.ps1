@@ -53,6 +53,7 @@ $FreshInstallStatusInProgress = "InProgress"
 $FreshInstallStatusComplete = "Complete"
 $RequiredLegacyMajorVersion = "10"
 $TargetMajorVersion = "11"
+$MSDBMAIntroducedVersion = "11.0.194"
 # DEV PHASE: points at mailsite.dev while v11 licensing is being tested.
 # Switch to https://www.mailsite.com (here and in Library's
 # DEFAULT_LICENSE_API_BASE_URL) before the first production release.
@@ -810,6 +811,20 @@ function Set-MSDBMAServiceCredentials {
         Created = [bool]$created
         Rotated = [bool]$rotated
     }
+}
+
+function Remove-MSDBMAClientCredentials {
+    $changed = $false
+    foreach ($serviceName in $MSDBMAClientServiceNames) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $serviceName)) { continue }
+        if (Remove-MailSiteServiceEnvironmentVariable -ServiceName $serviceName -Name $MSDBMAServiceTokenEnvironmentName) {
+            $changed = $true
+        }
+        if (Remove-MailSiteServiceEnvironmentVariable -ServiceName $serviceName -Name $MSDBMAMasterKeyEnvironmentName) {
+            $changed = $true
+        }
+    }
+    return $changed
 }
 
 function Stop-MailSiteService {
@@ -1781,28 +1796,36 @@ function Resolve-RequestedPackageVersion {
 function Get-PackageRoot {
     param([string]$ExtractRoot)
 
-    # The unreleased v11 package contract is deliberately current-only. The
-    # archive is flat and release notes live at its root; accepting older
-    # nested layouts here would make this installer a compatibility layer for
-    # development packages that may carry incompatible schemas.
+    # Supported v11 archives are flat and keep release notes at the root.
+    # MSDBMA is optional here because the installer may deliberately downgrade
+    # to a complete package from before the storage authority was introduced.
     $required = @(
-        "msdbma.exe", "httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe",
-        "imap4a.exe", "pop3a.exe", "smtpra.exe", "smtp-hook-host32.exe",
-        "smtpda.exe", "expresspro.exe", "console.exe", "release-notes.html"
+        "httpma.exe", "ewsma.exe", "mapima.exe", "easma.exe", "imap4a.exe",
+        "pop3a.exe", "smtpra.exe", "smtp-hook-host32.exe", "smtpda.exe",
+        "expresspro.exe", "console.exe", "release-notes.html"
     )
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $ExtractRoot $_) -PathType Leaf) })
     if ($missing.Count -eq 0) {
         return $ExtractRoot
     }
 
-    throw "Package does not use the current flat MailSite 11 layout. Missing root artifact(s): $($missing -join ', '). Older v11 packages are not supported; use a package from this build."
+    throw "Package does not use a supported flat MailSite 11 layout. Missing root artifact(s): $($missing -join ', ')."
+}
+
+function Get-PackageServices {
+    param([string]$PackageRoot)
+
+    return @($Services | Where-Object {
+        $_.Name -ne "MSDBMA" -or
+        (Test-Path -LiteralPath (Join-Path $PackageRoot $_.File) -PathType Leaf)
+    })
 }
 
 function Get-PackageVersion {
     param([string]$PackageRoot)
 
     $versions = @()
-    foreach ($component in @($Services) + @($SmtpHookHost32)) {
+    foreach ($component in @(Get-PackageServices -PackageRoot $PackageRoot) + @($SmtpHookHost32)) {
         $exe = Join-Path $PackageRoot $component.File
         if ($component.Name -eq $SmtpHookHost32.Name) {
             Assert-SmtpHookHost32Architecture -Path $exe
@@ -1819,7 +1842,14 @@ function Get-PackageVersion {
         throw "Package contains mixed executable versions: $($uniqueVersions -join ', ')."
     }
 
-    return $uniqueVersions[0]
+    $packageVersion = $uniqueVersions[0]
+    $msdbmaPath = Join-Path $PackageRoot "msdbma.exe"
+    if (-not (Test-Path -LiteralPath $msdbmaPath -PathType Leaf) -and
+        (Compare-MailSiteVersions -Left $packageVersion -Right $MSDBMAIntroducedVersion) -ge 0) {
+        throw "MailSite $packageVersion requires msdbma.exe, but the package does not contain it. Only historical packages older than $MSDBMAIntroducedVersion may omit MSDBMA."
+    }
+
+    return $packageVersion
 }
 
 function Test-MailSiteVersionDetectionRequired {
@@ -2545,7 +2575,7 @@ function Write-MailSite11DowngradeWarning {
         [string]$TargetVersion
     )
 
-    Write-InstallerMessage "Downgrading MailSite $InstalledVersion to $TargetVersion in place. Existing MailSite 11 databases are not rolled back; the installed services will inspect them before any service is restarted." -Level "WARN"
+    Write-InstallerMessage "Downgrading MailSite $InstalledVersion to $TargetVersion in place. Existing MailSite 11 databases are not rolled back. The installer will check them before restart when the target package supports schema inspection; otherwise it will warn and continue without a schema verdict." -Level "WARN"
 }
 
 function Compare-MailSiteVersions {
@@ -2648,6 +2678,15 @@ function Invoke-MailSiteDatabaseSchemaReport {
         [switch]$DeleteIncompatible
     )
 
+    if ([string]::IsNullOrWhiteSpace($MsdbmaPath) -or
+        -not (Test-Path -LiteralPath $MsdbmaPath -PathType Leaf)) {
+        return @{
+            Available = $false
+            Error = "The target package does not include MSDBMA schema inspection."
+            Report = $null
+        }
+    }
+
     $arguments = @("database-schemas", "--json")
     if ($DeleteIncompatible) {
         $arguments += "--delete-incompatible"
@@ -2708,12 +2747,19 @@ function Invoke-MailSiteDatabaseSchemaReport {
 }
 
 function Resolve-MailSitePostInstallDatabaseSchemas {
-    param([string]$MsdbmaPath)
+    param(
+        [string]$MsdbmaPath,
+        [switch]$AllowUnavailable
+    )
 
-    Write-InstallerMessage "Checking existing MailSite 11 database schemas with the installed MSDBMA build..."
+    Write-InstallerMessage "Checking existing MailSite 11 database schemas with the target package's MSDBMA build..."
     $inspection = Invoke-MailSiteDatabaseSchemaReport -MsdbmaPath $MsdbmaPath
     if (-not $inspection.Available) {
         Write-InstallerMessage "Could not verify the existing database schemas: $($inspection.Error)" -Level "WARN"
+        if ($AllowUnavailable) {
+            Write-InstallerMessage "Continuing the downgrade without database schema verification. The target package does not provide a usable schema checker; its services may fail to start or may be unable to open databases created by a newer build." -Level "WARN"
+            return $true
+        }
         Write-InstallerMessage "The package remains installed, but MailSite services will stay stopped so an incompatible database is not opened." -Level "WARN"
         return $false
     }
@@ -2726,10 +2772,18 @@ function Resolve-MailSitePostInstallDatabaseSchemas {
             foreach ($errorMessage in $discoveryErrors) {
                 Write-InstallerMessage "Database discovery error: $errorMessage" -Level "WARN"
             }
+            if ($AllowUnavailable) {
+                Write-InstallerMessage "Continuing the downgrade without complete database schema verification. The target services may fail to start or open an undiscovered database." -Level "WARN"
+                return $true
+            }
             Write-InstallerMessage "The package remains installed, but MailSite services will stay stopped because schema inspection was incomplete." -Level "WARN"
             return $false
         }
         if (-not [bool]$report.compatible) {
+            if ($AllowUnavailable) {
+                Write-InstallerMessage "MSDBMA could not provide a complete schema verdict. Continuing the downgrade without complete database schema verification; the target services may fail to start or open an existing database." -Level "WARN"
+                return $true
+            }
             Write-InstallerMessage "MSDBMA reported that the database set is incompatible but did not identify a database that can be removed safely. The package remains installed and MailSite services will stay stopped." -Level "WARN"
             return $false
         }
@@ -2746,6 +2800,10 @@ function Resolve-MailSitePostInstallDatabaseSchemas {
     }
     foreach ($database in @($incompatible | Select-Object -First 10)) {
         Write-InstallerMessage "  $($database.path)" -Level "WARN"
+        $detailProperty = $database.PSObject.Properties["detail"]
+        if ($null -ne $detailProperty -and -not [string]::IsNullOrWhiteSpace([string]$detailProperty.Value)) {
+            Write-InstallerMessage "    $($detailProperty.Value)" -Level "WARN"
+        }
     }
     if ($incompatible.Count -gt 10) {
         Write-InstallerMessage "  ...and $($incompatible.Count - 10) more incompatible database(s)." -Level "WARN"
@@ -2776,9 +2834,16 @@ function Resolve-MailSitePostInstallDatabaseSchemas {
         Write-InstallerMessage "Database discovery error after deletion: $errorMessage" -Level "WARN"
     }
     $remaining = @($cleanupReport.databases | Where-Object { -not [bool]$_.compatible })
-    if ($remaining.Count -gt 0 -or @($cleanupReport.deletionErrors).Count -gt 0 -or
-        @($cleanupReport.discoveryErrors).Count -gt 0 -or -not [bool]$cleanupReport.compatible) {
+    if ($remaining.Count -gt 0 -or @($cleanupReport.deletionErrors).Count -gt 0) {
         Write-InstallerMessage "Database cleanup was incomplete; $($remaining.Count) incompatible database(s) remain. MailSite services will stay stopped." -Level "WARN"
+        return $false
+    }
+    if (@($cleanupReport.discoveryErrors).Count -gt 0 -or -not [bool]$cleanupReport.compatible) {
+        if ($AllowUnavailable) {
+            Write-InstallerMessage "Known incompatible databases were deleted, but schema discovery could not be completed. Continuing the downgrade without complete verification; the target services may fail to start or open an undiscovered database." -Level "WARN"
+            return $true
+        }
+        Write-InstallerMessage "Database cleanup could not be verified completely. MailSite services will stay stopped." -Level "WARN"
         return $false
     }
 
@@ -3284,6 +3349,42 @@ function Wait-MailSiteServiceRemoved {
     throw "Timed out waiting for the $ServiceName Windows service to be removed."
 }
 
+function Retire-MSDBMAForPreMSDBMATarget {
+    [void](Remove-MSDBMAClientCredentials)
+
+    if (Test-MailSiteServiceInstalled -ServiceName "MSDBMA") {
+        Write-InstallerMessage "The target package predates MSDBMA. Removing the stopped MSDBMA service registration..." -Level "WARN"
+        & sc.exe delete "MSDBMA" | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            try {
+                Wait-MailSiteServiceRemoved -ServiceName "MSDBMA"
+            } catch {
+                Write-InstallerMessage "MSDBMA was marked for deletion but Windows has not removed it yet. It will remain stopped and will not be restarted by this installation." -Level "WARN"
+            }
+        } else {
+            Write-InstallerMessage "Could not remove the obsolete MSDBMA service registration (sc.exe exit code $LASTEXITCODE). Disabling it so it cannot start with the pre-MSDBMA target package." -Level "WARN"
+            try {
+                Set-Service -Name "MSDBMA" -StartupType Disabled -ErrorAction Stop
+            } catch {
+                Write-InstallerMessage "Could not disable the obsolete MSDBMA service: $($_.Exception.Message). It remains stopped, but must be removed or disabled before reboot." -Level "WARN"
+            }
+        }
+    }
+
+    $installedExecutable = Join-Path $InstallDir "msdbma.exe"
+    if (Test-Path -LiteralPath $installedExecutable -PathType Leaf) {
+        $retiredDirectory = Join-Path (Join-Path $InstallDir $InstallDataDirectoryName) "RetiredComponents"
+        New-Item -ItemType Directory -Path $retiredDirectory -Force | Out-Null
+        $retiredExecutable = Join-Path $retiredDirectory "msdbma.exe.pre-target"
+        try {
+            Move-Item -LiteralPath $installedExecutable -Destination $retiredExecutable -Force
+            Write-InstallerMessage "Moved the inactive MSDBMA executable out of the target package root."
+        } catch {
+            Write-InstallerMessage "Could not retire ${installedExecutable}: $($_.Exception.Message). The target services will not start MSDBMA, but a future installer may report the retained executable as a mixed build." -Level "WARN"
+        }
+    }
+}
+
 function Get-InstalledMailSiteServiceNames {
     $installed = @()
     foreach ($service in $Services) {
@@ -3556,6 +3657,9 @@ function Install-MailSiteFresh {
         Expand-Archive -Path $package -DestinationPath $extractRoot -Force
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
+        if (-not (Test-Path -LiteralPath (Join-Path $packageRoot "msdbma.exe") -PathType Leaf)) {
+            throw "A pre-MSDBMA MailSite package can be used only to downgrade an existing completed v11 installation; it cannot be used for a fresh install."
+        }
         if ($isResume -and $targetVersion -ne $requestedVersion) {
             throw "Interrupted fresh install requires MailSite $requestedVersion, but the prepared package is $targetVersion."
         }
@@ -3830,6 +3934,13 @@ function Install-MailSite {
         Expand-Archive -Path $package -DestinationPath $extractRoot -Force
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
+        $targetServices = @(Get-PackageServices -PackageRoot $packageRoot)
+        $targetHasMSDBMA = @($targetServices | Where-Object { $_.Name -eq "MSDBMA" }).Count -eq 1
+        $isDowngrade = (Test-ExactMailSiteVersion -Version $installedVersion) -and
+            ((Compare-MailSiteVersions -Left $targetVersion -Right $installedVersion) -lt 0)
+        if (-not $targetHasMSDBMA -and -not $installedState.HasV11Artifacts) {
+            throw "A pre-MSDBMA MailSite package can be used only to downgrade an existing completed v11 installation."
+        }
 
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
             Assert-MailSite11VersionTransition -InstalledVersion $installedVersion -TargetVersion $targetVersion
@@ -3898,7 +4009,9 @@ function Install-MailSite {
                 }
                 $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
             } else {
-                Write-InstallerMessage "$($service.Name) Windows service is not installed; it will be created."
+                if (@($targetServices | Where-Object { $_.Name -eq $service.Name }).Count -gt 0) {
+                    Write-InstallerMessage "$($service.Name) Windows service is not installed; it will be created."
+                }
                 $rollbackImagePath[$service.Name] = $null
                 $state.WasRunning[$service.Name] = $false
             }
@@ -3919,7 +4032,7 @@ function Install-MailSite {
 
         Save-InstallerState -State $state
 
-        foreach ($service in $Services) {
+        foreach ($service in $targetServices) {
             $newExe = Join-Path $InstallDir $service.File
             if (-not (Test-Path -LiteralPath $newExe)) {
                 throw "Package did not install $newExe."
@@ -3936,15 +4049,20 @@ function Install-MailSite {
             Set-MailSiteFirewallRules -Service $service -ExecutablePath $newExe
         }
 
-        $credentialProvisioning = Set-MSDBMAServiceCredentials
-        if ($credentialProvisioning.Created) {
-            Write-InstallerMessage "Provisioned a new MSDBMA authentication master key and private per-service credentials."
-        } elseif ($credentialProvisioning.Rotated) {
-            Write-InstallerMessage "Replaced an invalid MSDBMA authentication master key and repaired every service credential."
-        } elseif ($credentialProvisioning.Changed) {
-            Write-InstallerMessage "Repaired MSDBMA private per-service credentials."
+        if ($targetHasMSDBMA) {
+            $credentialProvisioning = Set-MSDBMAServiceCredentials
+            if ($credentialProvisioning.Created) {
+                Write-InstallerMessage "Provisioned a new MSDBMA authentication master key and private per-service credentials."
+            } elseif ($credentialProvisioning.Rotated) {
+                Write-InstallerMessage "Replaced an invalid MSDBMA authentication master key and repaired every service credential."
+            } elseif ($credentialProvisioning.Changed) {
+                Write-InstallerMessage "Repaired MSDBMA private per-service credentials."
+            } else {
+                Write-InstallerMessage "MSDBMA private per-service credentials are already configured."
+            }
         } else {
-            Write-InstallerMessage "MSDBMA private per-service credentials are already configured."
+            [void](Remove-MSDBMAClientCredentials)
+            Write-InstallerMessage "The target package predates MSDBMA; removed MSDBMA client credentials from its services." -Level "WARN"
         }
 
         $serviceAccountAudit = Get-MailSiteServiceAccountAudit
@@ -3954,7 +4072,11 @@ function Install-MailSite {
 
         Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
 
-        $schemasReady = Resolve-MailSitePostInstallDatabaseSchemas -MsdbmaPath (Join-Path $InstallDir "msdbma.exe")
+        $schemaCheckerPath = if ($targetHasMSDBMA) { Join-Path $InstallDir "msdbma.exe" } else { $null }
+        $allowUnavailableSchemaCheck = $isDowngrade -or (-not $targetHasMSDBMA -and $installedState.HasV11Artifacts)
+        $schemasReady = Resolve-MailSitePostInstallDatabaseSchemas `
+            -MsdbmaPath $schemaCheckerPath `
+            -AllowUnavailable:$allowUnavailableSchemaCheck
         if (-not $schemasReady) {
             Write-InstallerMessage "MailSite $targetVersion installation completed. Previously running services were deliberately left stopped pending database schema resolution." -Level "WARN"
             return
@@ -3963,13 +4085,17 @@ function Install-MailSite {
         $startNewServices = (@($state.WasRunning.Values | Where-Object { $_ -eq $true }).Count -gt 0)
         $restartRequested = @()
         $restartFailures = @()
-        foreach ($service in $Services) {
+        foreach ($service in $targetServices) {
             if ($state.WasRunning[$service.Name] -or ($startNewServices -and ($createdServices -contains $service.Name))) {
                 $restartRequested += $service.Name
                 if (-not (Start-MailSiteService -ServiceName $service.Name)) {
                     $restartFailures += $service.Name
                 }
             }
+        }
+
+        if (-not $targetHasMSDBMA) {
+            Retire-MSDBMAForPreMSDBMATarget
         }
 
         if ($restartFailures.Count -gt 0) {
