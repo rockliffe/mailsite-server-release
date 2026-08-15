@@ -28,7 +28,7 @@ $Services = @(
     @{ Name = "SMTPRA"; File = "smtpra.exe"; Description = "MailSite SMTP Receiving Agent" },
     @{ Name = "SMTPDA"; File = "smtpda.exe"; Description = "MailSite SMTP Delivery Agent" }
 )
-$MSDBMAClientServiceNames = @("HTTPMA", "EWSMA", "MAPIMA", "EASMA", "IMAP4A", "POP3A", "SMTPRA", "SMTPDA")
+$MSDBMAClientServiceNames = @("HTTPMA", "EWSMA", "MAPIMA", "EASMA", "IMAP4A", "POP3A", "SMTPRA", "SMTPDA", "MAINTENANCE")
 $MSDBMAMasterKeyEnvironmentName = "MSDBMA_AUTH_MASTER_KEY"
 $MSDBMAServiceTokenEnvironmentName = "MSDBMA_SERVICE_TOKEN"
 $MSDBMACredentialContext = "mailsite-msdbma-client-v1:"
@@ -2120,11 +2120,23 @@ function ConvertTo-CurrentInstallerState {
 
     $requiredProperties = @(
         "FreshInstall", "PreviousImagePath", "PreviousDescription",
-        "PreviousServiceRegistryAccessSddl", "WasRunning"
+        "WasRunning"
     )
     $missingProperties = @($requiredProperties | Where-Object { -not (Test-InstallerStateHasProperty -State $State -PropertyName $_) })
     if ($missingProperties.Count -gt 0) {
         throw "Installer state version $stateVersion is missing required property/properties: $($missingProperties -join ', '). Use the matching old uninstaller before installing this build."
+    }
+
+    if (-not (Test-InstallerStateHasProperty -State $State -PropertyName "PreviousServiceRegistryAccessSddl")) {
+        # Earlier states in this recognized schema predate service-key ACL
+        # snapshots. Fresh installs have no legacy ACL to restore. For v10
+        # conversions, the normal service scan captures the current ACL into
+        # this map and saves it before credential provisioning protects the
+        # service registry keys.
+        Set-InstallerStatePropertyValue `
+            -State $State `
+            -PropertyName "PreviousServiceRegistryAccessSddl" `
+            -Value @{}
     }
 
     Write-InstallerMessage "MailSite $targetVersion uses installer state version $stateVersion. Upgrading the completed installer state to version $InstallerStateVersion so this v11 installation can be upgraded in place." -Level "WARN"
@@ -3091,7 +3103,7 @@ function Grant-ServiceLogonRight {
 
 function Invoke-MailSiteFreshSetup {
     param(
-        [string]$HttpmaPath,
+        [string]$MsdbmaPath,
         [string]$LicenseKey,
         [string]$DomainName,
         [string]$PostmasterPassword,
@@ -3108,10 +3120,10 @@ function Invoke-MailSiteFreshSetup {
         "--version", $Version,
         "--install-dir", $InstallDirectory
     )
-    $result = Invoke-MailSiteExecutable -FilePath $HttpmaPath -ArgumentList $arguments
+    $result = Invoke-MailSiteExecutable -FilePath $MsdbmaPath -ArgumentList $arguments
     if ($result.ExitCode -ne 0) {
         $detail = (@($result.Output) -join [Environment]::NewLine).Trim()
-        throw "MailSite setup failed (httpma.exe setup exited with code $($result.ExitCode)). $detail"
+        throw "MailSite setup failed (msdbma.exe setup exited with code $($result.ExitCode)). $detail"
     }
 
     Write-InstallerMessage "MailSite configuration defaults were created."
@@ -3522,7 +3534,7 @@ function Install-MailSiteFresh {
         New-MailSiteDesktopShortcuts -RootDirectory $InstallDir
 
         Invoke-MailSiteFreshSetup `
-            -HttpmaPath (Join-Path $InstallDir "httpma.exe") `
+            -MsdbmaPath (Join-Path $InstallDir "msdbma.exe") `
             -LicenseKey $licenseKey `
             -DomainName $domainName `
             -PostmasterPassword $postmaster.Password `
