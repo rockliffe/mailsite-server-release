@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$InstallDir = (Join-Path $env:ProgramFiles "MailSite")
 )
