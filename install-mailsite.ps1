@@ -2389,11 +2389,39 @@ function Assert-InstallerStateVersion {
     }
 }
 
-function Assert-NoInterruptedUpgrade {
+function Test-InterruptedUpgrade {
     param([object]$State)
-    $status = Get-InstallerStatePropertyValue -State $State -PropertyName 'InstallStatus'
-    if ($status -eq 'InProgress' -and (Get-InstallerStatePropertyValue -State $State -PropertyName 'Operation') -eq 'Upgrade') {
-        throw 'An interrupted package replacement requires recovery before another installation. Existing services remain disabled; no files were changed.'
+    return ((Get-InstallerStatePropertyValue -State $State -PropertyName 'InstallStatus') -eq 'InProgress' -and
+        (Get-InstallerStatePropertyValue -State $State -PropertyName 'Operation') -eq 'Upgrade')
+}
+
+function Assert-InterruptedUpgradeRecovery {
+    param([object]$State)
+    Assert-InstallerStateVersion -State $State
+    Assert-FreshInstallStateDirectory -State $State
+    if (-not (Test-InterruptedUpgrade -State $State) -or
+        -not (Test-ExactMailSiteVersion -Version $State.TargetVersion) -or
+        $State.FreshInstall -isnot [bool]) { throw 'Invalid interrupted replacement state.' }
+    $modes = Copy-StateMap -State $State -PropertyName 'UpgradeStartTypes'
+    $running = Copy-StateMap -State $State -PropertyName 'WasRunning'
+    if ($modes.Count -eq 0) { throw 'Interrupted replacement has no saved service startup modes.' }
+    foreach ($name in $modes.Keys) {
+        if ($name -notin $Services.Name -or $modes[$name] -notin @(2,3,4) -or
+            $running[$name] -isnot [bool]) { throw "Invalid saved service settings for $name." }
+    }
+    foreach ($service in $Services) {
+        if (-not (Test-MailSiteServiceInstalled -ServiceName $service.Name)) { continue }
+        if (-not (Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)")) {
+            throw "Windows still lists $($service.Name), but its service registry key is missing. Restart Windows to finish the pending service removal, then rerun this installer."
+        }
+        $actual = Get-ServiceExecutablePathFromImagePath -ImagePath (Get-ServiceImagePath -ServiceName $service.Name)
+        $expected = Join-Path $InstallDir $service.File
+        $previous = Get-ServiceExecutablePathFromImagePath -ImagePath ([string]$State.PreviousImagePath.($service.Name))
+        if (-not (Test-MailSitePathEqual -Left $actual -Right $expected) -and
+            ($State.FreshInstall -or [string]::IsNullOrWhiteSpace($previous) -or
+             -not (Test-MailSitePathEqual -Left $actual -Right $previous))) {
+            throw "Cannot repair service $($service.Name): its executable is outside the saved installation."
+        }
     }
 }
 
@@ -2417,7 +2445,7 @@ function Test-InProgressFreshInstall {
     if ($null -eq $State -or -not [bool](Get-InstallerStatePropertyValue -State $State -PropertyName "FreshInstall")) {
         return $false
     }
-    return (Get-InstallerStateStatus -State $State) -eq $FreshInstallStatusInProgress
+    return ((Get-InstallerStateStatus -State $State) -eq $FreshInstallStatusInProgress -and -not (Test-InterruptedUpgrade -State $State))
 }
 
 function Assert-FreshInstallStateDirectory {
@@ -2464,6 +2492,10 @@ function Copy-StateMap {
         return $result
     }
 
+    if ($State.$PropertyName -is [System.Collections.IDictionary]) {
+        foreach ($key in $State.$PropertyName.Keys) { $result[$key] = $State.$PropertyName[$key] }
+        return $result
+    }
     foreach ($property in $State.$PropertyName.PSObject.Properties) {
         $result[$property.Name] = $property.Value
     }
@@ -2749,6 +2781,10 @@ function Assert-ExistingMailSite11Contract {
             return
         }
         throw "MailSite 11 files exist in '$InstallDir', but no current installer state owns them. Earlier v11 builds are not adopted. Use their matching uninstaller or remove the v11-only installation state, then install this build fresh."
+    }
+    if (Test-InterruptedUpgrade -State $InstallerState) {
+        Assert-InterruptedUpgradeRecovery -State $InstallerState
+        return
     }
     if ((Get-InstallerStateStatus -State $InstallerState) -ne $FreshInstallStatusComplete) {
         throw "The MailSite 11 installer state is not Complete and is not a resumable current fresh install. Use the matching uninstaller, then rebuild the v11 installation."
@@ -3646,6 +3682,12 @@ function Install-MailSiteFresh {
         Write-InstallerMessage "No existing MailSite installation was detected. Preparing a fresh MailSite $TargetMajorVersion install."
         Assert-NewFreshInstallHasNoServices
         $installRequest = Resolve-InstallRequest
+    if ($recoverUpgrade) {
+        # Repair the recorded target, independent of partial binary versions or latest.
+        $installRequest.RemoteVersion = [string]$installerState.TargetVersion
+        $installRequest.ForceReinstall = $true
+        $installRequest.Interactive = $false
+    }
         $requestedVersion = Resolve-RequestedPackageVersion -InstallRequest $installRequest
 
         Write-Host ""
@@ -3846,7 +3888,11 @@ function Install-MailSite {
     # before failing; classifying that as an upgrade would skip setup and lose
     # the selected service account.
     $installerState = Get-ExistingInstallerState
-    Assert-NoInterruptedUpgrade -State $installerState
+    $recoverUpgrade = Test-InterruptedUpgrade -State $installerState
+    if ($recoverUpgrade) {
+        Assert-InterruptedUpgradeRecovery -State $installerState
+        Write-InstallerMessage "Recovering interrupted MailSite $($installerState.TargetVersion) replacement with its complete package. Mail and configuration are retained." -Level 'WARN'
+    }
     if (Test-InProgressFreshInstall -State $installerState) {
         Install-MailSiteFresh -ResumeState $installerState
         return
@@ -3917,7 +3963,13 @@ function Install-MailSite {
     }
 
     $installRequest = Resolve-InstallRequest
-    if ($installedState.HasV11Artifacts -and $installRequest.ForceReinstall -and
+    if ($recoverUpgrade) {
+        # Repair the recorded target, independent of partial binary versions or latest.
+        $installRequest.RemoteVersion = [string]$installerState.TargetVersion
+        $installRequest.ForceReinstall = $true
+        $installRequest.Interactive = $false
+    }
+    if (-not $recoverUpgrade -and $installedState.HasV11Artifacts -and $installRequest.ForceReinstall -and
         [string]::IsNullOrWhiteSpace($PackagePath) -and -not (Test-SiblingPackageAvailable)) {
         if (Test-ExactMailSiteVersion -Version $installedVersion) {
             # A coherent installation can reinstall its exact detected build.
@@ -3991,6 +4043,9 @@ function Install-MailSite {
         Expand-Archive -Path $package -DestinationPath $extractRoot -Force
         $packageRoot = Get-PackageRoot -ExtractRoot $extractRoot
         $targetVersion = Get-PackageVersion -PackageRoot $packageRoot
+        if ($recoverUpgrade -and $targetVersion -ne $installerState.TargetVersion) {
+            throw "Recovery requires the complete MailSite $($installerState.TargetVersion) package, not $targetVersion."
+        }
         $targetServices = @(Get-PackageServices -PackageRoot $packageRoot)
         $targetHasMSDBMA = @($targetServices | Where-Object { $_.Name -eq "MSDBMA" }).Count -eq 1
         if (-not $targetHasMSDBMA -and -not $installedState.HasV11Artifacts) {
@@ -4038,16 +4093,25 @@ function Install-MailSite {
         $state.InstallStatus = 'InProgress'
         $state.Operation = 'Upgrade'
         $state.UpgradeStartTypes = @{}
+        if ($recoverUpgrade) {
+            $state.UpgradeStartTypes = Copy-StateMap -State $existingState -PropertyName 'UpgradeStartTypes'
+            $state.WasRunning = Copy-StateMap -State $existingState -PropertyName 'WasRunning'
+        }
         foreach ($service in $Services) {
             if (Test-MailSiteServiceInstalled -ServiceName $service.Name) {
                 $startType = [int](Get-ItemPropertyValue -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($service.Name)" -Name Start)
                 if ($startType -notin @(2,3,4)) { throw "Unsupported service startup mode for $($service.Name)." }
-                $state.UpgradeStartTypes[$service.Name] = $startType
+                if (-not $state.UpgradeStartTypes.ContainsKey($service.Name)) {
+                    $state.UpgradeStartTypes[$service.Name] = $startType
+                    $state.WasRunning[$service.Name] = (Get-Service -Name $service.Name).Status -eq 'Running'
+                }
             }
         }
         Save-InstallerState -State $state
         foreach ($name in $state.UpgradeStartTypes.Keys) {
-            Set-Service -Name $name -StartupType Disabled
+            if (Test-MailSiteServiceInstalled -ServiceName $name) {
+                Set-Service -Name $name -StartupType Disabled
+            }
         }
 
         # Stop protocol services before their storage authority. $Services is
@@ -4078,13 +4142,13 @@ function Install-MailSite {
                     # install.json.
                     $state.PreviousServiceRegistryAccessSddl[$service.Name] = $currentRegistryAccessSddl
                 }
-                $state.WasRunning[$service.Name] = Stop-MailSiteService -ServiceName $service.Name
+                [void](Stop-MailSiteService -ServiceName $service.Name)
             } else {
                 if (@($targetServices | Where-Object { $_.Name -eq $service.Name }).Count -gt 0) {
                     Write-InstallerMessage "$($service.Name) Windows service is not installed; it will be created."
                 }
                 $rollbackImagePath[$service.Name] = $null
-                $state.WasRunning[$service.Name] = $false
+                if (-not $state.WasRunning.ContainsKey($service.Name)) { $state.WasRunning[$service.Name] = $false }
             }
         }
         $servicesStopped = $true
@@ -4167,10 +4231,13 @@ function Install-MailSite {
         }
 
         if ($restartFailures.Count -gt 0) { throw "Services failed to restart: $($restartFailures -join ', ')." }
-        $state.InstallStatus = 'Complete'
-        $state.Remove('Operation')
-        $state.Remove('UpgradeStartTypes')
-        Save-InstallerState -State $state
+        # Keep failure recovery evidence until the completed marker is durable.
+        $completedState = $state.Clone()
+        $completedState.InstallStatus = 'Complete'
+        $completedState.Remove('Operation')
+        $completedState.Remove('UpgradeStartTypes')
+        Save-InstallerState -State $completedState
+        $state = $completedState
 
         if ($restartRequested.Count -gt 0) {
             Write-InstallerMessage "MailSite $targetVersion installation completed successfully. Restarted previously running services: $($restartRequested -join ', ')."
