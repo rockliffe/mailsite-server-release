@@ -58,7 +58,6 @@ $MSDBMAIntroducedVersion = "11.0.194"
 # Switch to https://www.mailsite.com (here and in Library's
 # DEFAULT_LICENSE_API_BASE_URL) before the first production release.
 $DefaultLicenseApiBaseUrl = "https://mailsite.dev"
-$FreshTrialLicenseRequest = "__MAILSITE_ONLINE_TRIAL__"
 $LicenseValidationCacheName = "license.json"
 # Marks authoritative license failures from Assert-MailSite10 so upgrade paths
 # can tell them apart from "MailSite 10 is not present" failures.
@@ -1109,9 +1108,9 @@ function Get-VisualCppRuntimeVersion {
     return $newest
 }
 
-# Inspect PE imports without executing the helper. Older packages still need
-# the x86 redistributable; the 11.0.231 host embeds its runtime.
-function Test-Win32RuntimeRequired {
+# Inspect package EXE/DLL imports without executing them. Current builds embed
+# the runtime; older dynamically linked packages still need the redistributable.
+function Test-VisualCppRuntimeRequired {
     param([string]$Path)
     $data = [IO.File]::ReadAllBytes($Path)
     function Read-PeNumber([long]$Offset, [int]$Size = 4) {
@@ -1121,12 +1120,15 @@ function Test-Win32RuntimeRequired {
     }
     if ((Read-PeNumber 0 2) -ne 0x5a4d) { throw 'Invalid DOS signature.' }
     $pe = [long](Read-PeNumber 0x3c)
-    if ((Read-PeNumber $pe) -ne 0x4550 -or (Read-PeNumber ($pe + 4) 2) -ne 0x14c) { throw 'Expected Win32 PE image.' }
+    if ((Read-PeNumber $pe) -ne 0x4550) { throw 'Invalid PE image.' }
+    $machine = Read-PeNumber ($pe + 4) 2
+    $directoryOffset = switch ($machine) { 0x14c {96} 0x8664 {112} 0xaa64 {112} default {throw 'Unsupported PE architecture.'} }
+    $magic = if ($machine -eq 0x14c) {0x10b} else {0x20b}
     $count = Read-PeNumber ($pe + 6) 2
     $optionalSize = Read-PeNumber ($pe + 20) 2
     $optional = $pe + 24
-    if ($optionalSize -lt 96 -or (Read-PeNumber $optional 2) -ne 0x10b) { throw 'Invalid PE32 optional header.' }
-    $directoryCount = Read-PeNumber ($optional + 92)
+    if ($optionalSize -lt $directoryOffset -or (Read-PeNumber $optional 2) -ne $magic) { throw 'Invalid PE optional header.' }
+    $directoryCount = Read-PeNumber ($optional + $directoryOffset - 4)
     $sections = @()
     for ($index = 0; $index -lt $count; $index++) {
         $section = $optional + $optionalSize + $index * 40
@@ -1147,9 +1149,9 @@ function Test-Win32RuntimeRequired {
     foreach ($directory in @(@(1,20,12), @(13,32,4))) {
         $number,$stride,$nameOffset = $directory
         if ($number -ge $directoryCount) { continue }
-        if (96 + ($number + 1) * 8 -gt $optionalSize) { throw 'Truncated PE import directory.' }
-        $rva = Read-PeNumber ($optional + 96 + $number * 8)
-        $size = Read-PeNumber ($optional + 100 + $number * 8)
+        if ($directoryOffset + ($number + 1) * 8 -gt $optionalSize) { throw 'Truncated PE import directory.' }
+        $rva = Read-PeNumber ($optional + $directoryOffset + $number * 8)
+        $size = Read-PeNumber ($optional + $directoryOffset + 4 + $number * 8)
         if ($rva -eq 0) {
             if ($size -ne 0) { throw 'Invalid empty PE directory.' }
             continue
@@ -1179,16 +1181,17 @@ function Test-Win32RuntimeRequired {
 function Get-PackageRuntimeArchitectures {
     param([string]$PackageRoot)
 
-    # Include desktop executables and the x86 SMTP hook host, not just services.
-    $architectures = foreach ($exe in (Get-ChildItem -LiteralPath $PackageRoot -Filter "*.exe" -File)) {
-        switch (Get-PortableExecutableMachine -Path $exe.FullName) {
-            0x014c { if (Test-Win32RuntimeRequired -Path $exe.FullName) { "x86" } }
+    $images = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll' })
+    if ($images.Count -eq 0) { throw "No executables found for runtime prerequisite detection." }
+    $architectures = foreach ($image in $images) {
+        if (-not (Test-VisualCppRuntimeRequired -Path $image.FullName)) { continue }
+        switch (Get-PortableExecutableMachine -Path $image.FullName) {
+            0x014c { "x86" }
             0x8664 { "x64" }
             0xaa64 { "arm64" }
-            default { throw "Unsupported executable architecture in $($exe.Name)." }
+            default { throw "Unsupported executable architecture in $($image.Name)." }
         }
     }
-    if (@(Get-ChildItem -LiteralPath $PackageRoot -Filter "*.exe" -File).Count -eq 0) { throw "No executables found for runtime prerequisite detection." }
     return @($architectures | Sort-Object -Unique)
 }
 
@@ -1530,8 +1533,7 @@ function ConvertFrom-MailSiteJsonSafe {
 function Invoke-MailSiteLicenseApiJson {
     param(
         [string]$Path,
-        [hashtable]$Body,
-        [Microsoft.PowerShell.Commands.WebRequestSession]$WebSession
+        [hashtable]$Body
     )
 
     $uri = Join-MailSiteLicenseApiUri -Path $Path
@@ -1543,9 +1545,6 @@ function Invoke-MailSiteLicenseApiJson {
         Body = $json
         TimeoutSec = 20
         ErrorAction = "Stop"
-    }
-    if ($null -ne $WebSession) {
-        $arguments.WebSession = $WebSession
     }
 
     try {
@@ -2992,88 +2991,43 @@ function Read-FreshInstallDomainName {
     }
 }
 
-function Read-FreshInstallLicenseKeyText {
-    $answer = Read-Host "MailSite license key (blank or TRIAL to sign in and create a 30-day trial)"
-    if ([string]::IsNullOrWhiteSpace($answer)) {
-        return $FreshTrialLicenseRequest
+function Request-MailSiteLicenseEmail {
+    Write-InstallerMessage "License service: $(Get-MailSiteLicenseApiBaseUrl)"
+    Write-InstallerMessage "Enter your email to receive active MailSite 11 keys or an eligible 30-day trial. No account password is needed."
+    while ($true) {
+        $email = Read-Host "Email address (blank to use an existing license key)"
+        if ([string]::IsNullOrWhiteSpace($email)) { return }
+        $email = $email.Trim().ToLowerInvariant()
+        if ($email.Length -gt 100 -or $email -notmatch '^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$') {
+            Write-InstallerMessage "Enter a valid email address." -Level "WARN"
+            continue
+        }
+        $response = Invoke-MailSiteLicenseApiJson -Path "/api/license/email" -Body @{ email = $email }
+        if ($response.Ok) {
+            Write-InstallerMessage "Check your email for license information, then enter a key below. An expired trial is not renewed."
+            return
+        }
+        Write-InstallerMessage "License email could not be requested: $(Get-MailSiteLicenseApiResponseMessage -Response $response)" -Level "WARN"
+        if (-not (Read-YesNo -Prompt "Request email again? (No lets you enter an existing key)" -DefaultYes $false)) { return }
     }
-
-    $candidate = $answer.Trim()
-    if ($candidate -ieq "TRIAL" -or $candidate -ieq "DEMO") {
-        return $FreshTrialLicenseRequest
-    }
-
-    return $candidate
 }
 
-function Test-FreshInstallTrialLicenseRequest {
-    param([string]$LicenseKey)
-
-    return [string]::IsNullOrWhiteSpace($LicenseKey) -or $LicenseKey -eq $FreshTrialLicenseRequest
+function Read-FreshInstallLicenseKeyText {
+    while ($true) {
+        $answer = Read-Host "MailSite license key (EMAIL to request keys, CANCEL to abort)"
+        $candidate = $answer.Trim()
+        if ($candidate -ieq "CANCEL") { throw "Installation cancelled before license validation." }
+        if ($candidate -ieq "EMAIL") { Request-MailSiteLicenseEmail; continue }
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) { return $candidate }
+        Write-InstallerMessage "Enter a license key, EMAIL, or CANCEL." -Level "WARN"
+    }
 }
 
 function Read-FreshInstallLicenseKeyRetry {
-    # Retry prompt after a failed license attempt. Offers an explicit abort so
-    # the operator is never stuck looping between the key prompt and a failing
-    # validation or trial sign-in.
-    if (-not (Read-YesNo -Prompt "Try another license key or trial sign-in? (n aborts the installation)" -DefaultYes $true)) {
+    if (-not (Read-YesNo -Prompt "Try another license key? (No aborts installation)" -DefaultYes $true)) {
         throw "Installation aborted: no valid MailSite license key was provided."
     }
-
     return Read-FreshInstallLicenseKeyText
-}
-
-function Request-MailSiteTrialLicense {
-    $baseUrl = Get-MailSiteLicenseApiBaseUrl
-    Write-InstallerMessage "A MailSite portal account is required to create a 30-day trial license."
-    Write-InstallerMessage "If you need an account, create one at $baseUrl/portal/sign-up, verify the email address, then return here."
-
-    while ($true) {
-        $email = Read-Host "MailSite account email (blank to enter a purchased license key instead)"
-        if ([string]::IsNullOrWhiteSpace($email)) {
-            return $null
-        }
-
-        $password = Read-MaskedInput -Prompt "MailSite account password"
-        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-        $login = Invoke-MailSiteLicenseApiJson `
-            -Path "/api/auth/login" `
-            -Body @{
-                email = $email.Trim()
-                password = $password
-                rememberMe = $false
-            } `
-            -WebSession $session
-
-        if (-not $login.Ok) {
-            Write-InstallerMessage "MailSite account sign-in failed: $(Get-MailSiteLicenseApiResponseMessage -Response $login)" -Level "WARN"
-            if (-not (Read-YesNo -Prompt "Try signing in again?" -DefaultYes $true)) {
-                return $null
-            }
-            continue
-        }
-
-        $trial = Invoke-MailSiteLicenseApiJson `
-            -Path "/api/license/trial" `
-            -Body @{} `
-            -WebSession $session
-
-        if ($trial.Ok -and $null -ne $trial.Body -and $trial.Body.valid -eq $true -and
-            -not [string]::IsNullOrWhiteSpace($trial.Body.license.licenseKey) -and
-            -not [string]::IsNullOrWhiteSpace($trial.Body.validationToken)) {
-            return @{
-                LicenseKey = [string]$trial.Body.license.licenseKey
-                IsTrial = [bool]$trial.Body.license.trial
-                OnlineValidation = $trial.Body
-                Summary = "$($trial.Body.license.package), expires $($trial.Body.license.expiresAt)"
-            }
-        }
-
-        Write-InstallerMessage "The MailSite trial license could not be created: $(Get-MailSiteLicenseApiResponseMessage -Response $trial)" -Level "WARN"
-        if (-not (Read-YesNo -Prompt "Try a different MailSite account?" -DefaultYes $true)) {
-            return $null
-        }
-    }
 }
 
 function Resolve-FreshInstallLicenseKey {
@@ -3083,37 +3037,11 @@ function Resolve-FreshInstallLicenseKey {
 
     $key = $InitialKey
     while ($true) {
-        # Validation payload returned by trial issuance for the current key,
-        # when the key came from Request-MailSiteTrialLicense this iteration.
-        $trialResolution = $null
-        if (Test-FreshInstallTrialLicenseRequest -LicenseKey $key) {
-            $trial = Request-MailSiteTrialLicense
-            if ($null -eq $trial) {
-                $key = Read-FreshInstallLicenseKeyRetry
-                continue
-            }
-            $key = $trial.LicenseKey
-            $trialResolution = $trial
-        }
-
-        if ($null -ne $trialResolution -and $null -ne $trialResolution.OnlineValidation) {
-            # Trial issuance already returned the mandatory signed website
-            # assertion; use it instead of making a redundant request.
-            Write-InstallerMessage "Using the signed validation returned with the MailSite trial license."
-            Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $trialResolution.OnlineValidation
-            return @{
-                LicenseKey = $key
-                IsTrial = $true
-                OnlineValidation = $trialResolution.OnlineValidation
-                Summary = $trialResolution.Summary
-            }
-        }
-
+        if ([string]::IsNullOrWhiteSpace($key)) { $key = Read-FreshInstallLicenseKeyText }
         Write-InstallerMessage "Validating MailSite license key with the MailSite license service..."
         $onlineValidation = Test-MailSiteOnlineLicenseValidation -LicenseKey $key -AllowedProductMajors @([int]$TargetMajorVersion)
         if ($onlineValidation.Outcome -eq "valid") {
             Write-InstallerMessage "MailSite license service accepted the license key and returned a signed assertion."
-            Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $onlineValidation.Body
             return @{
                 LicenseKey = $key
                 IsTrial = [bool]$onlineValidation.Body.license.trial
@@ -3707,11 +3635,19 @@ function Install-MailSiteFresh {
         # is cached for setup and runtime verification.
         Write-Host ""
         Write-Host "MailSite setup needs a few details before installing."
+        Request-MailSiteLicenseEmail
         $licenseKey = Read-FreshInstallLicenseKeyText
         $domainName = Read-FreshInstallDomainName
         $postmaster = Read-FreshInstallPostmasterPassword
         $serviceAccount = Read-FreshInstallServiceAccount
     }
+
+    # Reject invalid/unavailable licensing before package downloads or recovery service changes.
+    # Keep the signed result in memory until the package has also been validated.
+    $licenseResolution = Resolve-FreshInstallLicenseKey -InitialKey $licenseKey
+    $licenseKey = $licenseResolution.LicenseKey
+    $licenseIsTrial = [bool]$licenseResolution.IsTrial
+    $licenseSummary = $licenseResolution.Summary
 
     try {
         if ($isResume) {
@@ -3750,10 +3686,7 @@ function Install-MailSiteFresh {
             throw "Interrupted fresh install requires MailSite $requestedVersion, but the prepared package is $targetVersion."
         }
 
-        $licenseResolution = Resolve-FreshInstallLicenseKey -InitialKey $licenseKey
-        $licenseKey = $licenseResolution.LicenseKey
-        $licenseIsTrial = [bool]$licenseResolution.IsTrial
-        $licenseSummary = $licenseResolution.Summary
+        Save-MailSiteLicenseValidationCache -InstallDirectory $InstallDir -ValidationBody $licenseResolution.OnlineValidation
 
         if (-not $isResume) {
             if (Test-Path -LiteralPath $MailSiteKey32) {
