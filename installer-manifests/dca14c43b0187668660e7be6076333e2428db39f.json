@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "commit": "dca14c43b0187668660e7be6076333e2428db39f",
+  "scripts": {
+    "install": "70c0b1da845d0e32dfcc9843e1cf1553b7b25b7acee0cd07d302bea47e5b689f",
+    "uninstall": "6d02c554461d5fbb7828fbb2a3cc9ceec5a0f8e3f005892bcdd0665132ad6e2c"
+  }
+}
